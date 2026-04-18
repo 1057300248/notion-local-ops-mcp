@@ -70,7 +70,7 @@ registry = ExecutorRegistry(
 mcp = FastMCP(
     APP_NAME,
     instructions=(
-        "Use direct tools first for normal tasks: list/glob/grep/read/replace/write/patch/git/run. "
+        "Use direct tools first for normal tasks: list/glob/grep/read/replace/write/patch/git/run/list_skills. "
         "Prefer explicit delegate tools for executor work: delegate_doctor, codex_exec, claude_exec, "
         "claudecode_exec, codex_review, claude_review, and list_tasks. "
         "Keep delegate_task only as the compatibility fallback."
