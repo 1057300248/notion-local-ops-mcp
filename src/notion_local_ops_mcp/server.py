@@ -8,6 +8,8 @@ from fastmcp.server.dependencies import get_http_request
 from fastmcp.server.middleware import Middleware
 import uvicorn
 
+from .http_compat import build_http_compat_app
+
 from .config import (
     APP_NAME,
     AUTH_TOKEN,
@@ -67,14 +69,22 @@ registry = ExecutorRegistry(
     claude_command=CLAUDE_COMMAND,
 )
 
+MCP_INSTRUCTIONS = (
+    "Use direct tools first for normal tasks: list/glob/grep/read/replace/write/patch/git/run. "
+    "Use delegate_task only when direct tools are insufficient for a complex, long-running, or multi-file task."
+)
+
 mcp = FastMCP(
     APP_NAME,
-    instructions=(
-        "Use direct tools first for normal tasks: list/glob/grep/read/replace/write/patch/git/run. "
-        "Use delegate_task only when direct tools are insufficient for a complex, long-running, or multi-file task."
-    ),
+    instructions=MCP_INSTRUCTIONS,
     middleware=[BearerAuthMiddleware()],
 )
+
+
+def _current_auth_token() -> str:
+    # Resolved via module globals so tests that monkeypatch ``AUTH_TOKEN`` on
+    # this module (and runtime overrides) are honored per-request.
+    return globals().get("AUTH_TOKEN", "") or ""
 
 
 @mcp.tool(
@@ -360,9 +370,21 @@ def cancel_task(task_id: str) -> dict[str, object]:
 
 
 def build_http_app():
-    return mcp.http_app(
+    streamable_app = mcp.http_app(
         path="/mcp",
         transport="streamable-http",
+    )
+    legacy_sse_app = mcp.http_app(
+        path="/mcp",
+        transport="sse",
+    )
+    return build_http_compat_app(
+        streamable_app=streamable_app,
+        legacy_sse_app=legacy_sse_app,
+        app_name=APP_NAME,
+        mcp_path="/mcp",
+        get_auth_token=_current_auth_token,
+        instructions=MCP_INSTRUCTIONS,
     )
 
 
