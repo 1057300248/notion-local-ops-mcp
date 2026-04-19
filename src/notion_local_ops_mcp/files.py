@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import os
 import subprocess
 from fnmatch import fnmatch
@@ -340,6 +341,55 @@ def write_file(path: Path, *, content: str) -> dict[str, object]:
     }
 
 
+def _line_numbers_of(original: str, needle: str) -> list[int]:
+    """Return 1-based line numbers at which ``needle`` starts in ``original``."""
+    positions: list[int] = []
+    start = 0
+    while True:
+        idx = original.find(needle, start)
+        if idx < 0:
+            break
+        positions.append(original.count("\n", 0, idx) + 1)
+        start = idx + max(len(needle), 1)
+    return positions
+
+
+def _fuzzy_candidates(
+    original: str, needle: str, *, k: int = 3
+) -> list[dict[str, object]]:
+    """Find the top ``k`` line windows in ``original`` that most resemble
+    ``needle``. Returned entries include a 1-based ``line`` and a short
+    ``snippet`` preview so callers can show “did you mean this?” hints.
+    """
+    needle_lines = needle.splitlines() or [""]
+    window_size = max(len(needle_lines), 1)
+    all_lines = original.splitlines()
+    if not all_lines:
+        return []
+
+    scored: list[tuple[float, int, str]] = []
+    for i in range(0, max(len(all_lines) - window_size + 1, 1)):
+        window = "\n".join(all_lines[i : i + window_size])
+        ratio = difflib.SequenceMatcher(None, window, needle, autojunk=False).ratio()
+        if ratio <= 0.0:
+            continue
+        scored.append((ratio, i + 1, window))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    suggestions: list[dict[str, object]] = []
+    for ratio, line_no, snippet in scored[:k]:
+        # Keep previews short so we do not blow up the response size.
+        preview = snippet if len(snippet) <= 400 else snippet[:400] + "\u2026"
+        suggestions.append(
+            {
+                "line": line_no,
+                "similarity": round(ratio, 3),
+                "snippet": preview,
+            }
+        )
+    return suggestions
+
+
 def replace_in_file(
     path: Path,
     *,
@@ -357,15 +407,31 @@ def replace_in_file(
     except ValueError as exc:
         return _error("not_text_file", str(exc), resolved_path=str(path))
 
+    if not old_text:
+        return _error(
+            "empty_old_text",
+            "old_text must not be empty; to write a file from scratch use write_file.",
+            resolved_path=str(path),
+        )
+
     occurrences = original.count(old_text)
     if occurrences == 0:
-        return _error("match_not_found", "old_text was not found.", resolved_path=str(path))
+        return _error(
+            "match_not_found",
+            "old_text was not found. See `candidates` for the closest line windows in the file.",
+            resolved_path=str(path),
+            candidates=_fuzzy_candidates(original, old_text, k=3),
+        )
     if occurrences > 1 and not replace_all:
         return _error(
             "match_not_unique",
-            f"old_text matched {occurrences} times; provide a unique fragment.",
+            (
+                f"old_text matched {occurrences} times; provide a unique fragment "
+                "or pass replace_all=True."
+            ),
             resolved_path=str(path),
             occurrences=occurrences,
+            match_lines=_line_numbers_of(original, old_text),
         )
 
     replacements = occurrences if replace_all else 1

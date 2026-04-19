@@ -153,6 +153,48 @@ def test_replace_in_file_requires_unique_match(tmp_path: Path) -> None:
     assert result["replacements"] == 1
 
 
+def test_replace_in_file_returns_candidates_when_not_found(tmp_path: Path) -> None:
+    target = tmp_path / "app.py"
+    target.write_text(
+        "def greet(name):\n    print('hello ' + name)\n\n"
+        "def farewell(name):\n    print('bye ' + name)\n",
+        encoding="utf-8",
+    )
+
+    result = replace_in_file(target, old_text="print('hi ' + name)", new_text="x")
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "match_not_found"
+    candidates = result["candidates"]
+    assert isinstance(candidates, list) and candidates
+    top = candidates[0]
+    assert {"line", "similarity", "snippet"} <= set(top)
+    # Top suggestion should point at one of the two print(...) lines.
+    assert "print(" in top["snippet"]
+
+
+def test_replace_in_file_returns_match_lines_when_not_unique(tmp_path: Path) -> None:
+    target = tmp_path / "app.py"
+    target.write_text("x\nTODO\ny\nTODO\nz\n", encoding="utf-8")
+
+    result = replace_in_file(target, old_text="TODO", new_text="DONE")
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "match_not_unique"
+    assert result["occurrences"] == 2
+    assert result["match_lines"] == [2, 4]
+
+
+def test_replace_in_file_rejects_empty_old_text(tmp_path: Path) -> None:
+    target = tmp_path / "app.py"
+    target.write_text("hi\n", encoding="utf-8")
+
+    result = replace_in_file(target, old_text="", new_text="x")
+
+    assert result["success"] is False
+    assert result["error"]["code"] == "empty_old_text"
+
+
 def test_replace_in_file_can_replace_all_matches(tmp_path: Path) -> None:
     target = tmp_path / "app.py"
     target.write_text("before\nbefore\n", encoding="utf-8")
