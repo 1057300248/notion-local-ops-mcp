@@ -36,7 +36,6 @@ from . import session
 from .pathing import resolve_cwd, resolve_path
 from .search import glob_files as glob_files_impl
 from .search import grep_files as grep_files_impl
-from .search import search_files as search_files_impl
 from .shell import run_command as run_command_impl
 from .skills import list_skills as list_skills_impl
 from .tasks import TaskStore
@@ -157,16 +156,15 @@ def search(
     if mode in {"regex", "text"}:
         effective_pattern = pattern
         if mode == "text":
-            literal = query if query is not None else pattern
-            if literal is None:
+            if query is None:
                 return {
                     "success": False,
                     "error": {
                         "code": "missing_query",
-                        "message": "mode=text requires `query` (or `pattern` for backward compatibility).",
+                        "message": "mode=text requires `query`.",
                     },
                 }
-            effective_pattern = re.escape(literal)
+            effective_pattern = re.escape(query)
         elif effective_pattern is None:
             return {
                 "success": False,
@@ -201,65 +199,6 @@ def search(
 
 
 @mcp.tool(
-    name="search_files",
-    description="Legacy alias for simple substring search. Prefer `search(mode='text', ...)`.",
-)
-def search_files(
-    query: str,
-    path: str | None = None,
-    glob: str | None = None,
-    limit: int = 100,
-) -> dict[str, object]:
-    target = resolve_path(path or ".", WORKSPACE_ROOT)
-    return search_files_impl(target, query=query, glob_pattern=glob, limit=limit)
-
-
-@mcp.tool(
-    name="glob_files",
-    description="Legacy alias for glob path discovery. Prefer `search(mode='glob', ...)`.",
-)
-def glob_files(
-    pattern: str,
-    path: str | None = None,
-    limit: int = 200,
-    offset: int = 0,
-) -> dict[str, object]:
-    target = resolve_path(path or ".", WORKSPACE_ROOT)
-    return glob_files_impl(target, pattern=pattern, limit=limit, offset=offset)
-
-
-@mcp.tool(
-    name="grep_files",
-    description="Legacy alias for regex search. Prefer `search(mode='regex', ...)`.",
-)
-def grep_files(
-    pattern: str,
-    path: str | None = None,
-    glob: str | None = None,
-    output_mode: str = "content",
-    before: int = 0,
-    after: int = 0,
-    ignore_case: bool = False,
-    limit: int = 200,
-    offset: int = 0,
-    multiline: bool = False,
-) -> dict[str, object]:
-    target = resolve_path(path or ".", WORKSPACE_ROOT)
-    return grep_files_impl(
-        target,
-        pattern=pattern,
-        glob_pattern=glob,
-        output_mode=output_mode,
-        before=before,
-        after=after,
-        ignore_case=ignore_case,
-        head_limit=limit,
-        offset=offset,
-        multiline=multiline,
-    )
-
-
-@mcp.tool(
     name="read_text",
     description=(
         "Canonical text-reader tool. Pass either `path` for single-file reads or "
@@ -269,8 +208,6 @@ def grep_files(
 def read_text(
     path: str | None = None,
     paths: list[str] | None = None,
-    offset: int | None = None,
-    limit: int | None = None,
     start_line: int | None = None,
     line_limit: int | None = None,
 ) -> dict[str, object]:
@@ -285,8 +222,8 @@ def read_text(
             },
         }
 
-    effective_offset = start_line if start_line is not None else offset
-    effective_limit = line_limit if line_limit is not None else limit
+    effective_offset = start_line
+    effective_limit = line_limit
     if path:
         target = resolve_path(path, WORKSPACE_ROOT)
         result = read_file_impl(
@@ -311,50 +248,6 @@ def read_text(
     if isinstance(result, dict):
         result["mode"] = "batch"
     return result
-
-
-@mcp.tool(
-    name="read_file",
-    description=(
-        "Legacy single-file reader. Prefer `read_text(path=..., start_line=..., line_limit=...)`."
-    ),
-)
-def read_file(
-    path: str,
-    offset: int | None = None,
-    limit: int | None = None,
-    start_line: int | None = None,
-    line_limit: int | None = None,
-) -> dict[str, object]:
-    target = resolve_path(path, WORKSPACE_ROOT)
-    effective_offset = start_line if start_line is not None else offset
-    effective_limit = line_limit if line_limit is not None else limit
-    return read_file_impl(target, offset=effective_offset, limit=effective_limit, max_lines=200, max_bytes=32768)
-
-
-@mcp.tool(
-    name="read_files",
-    description=(
-        "Legacy batch reader. Prefer `read_text(paths=[...], start_line=..., line_limit=...)`."
-    ),
-)
-def read_files(
-    paths: list[str],
-    offset: int | None = None,
-    limit: int | None = None,
-    start_line: int | None = None,
-    line_limit: int | None = None,
-) -> dict[str, object]:
-    targets = [resolve_path(path, WORKSPACE_ROOT) for path in paths]
-    effective_offset = start_line if start_line is not None else offset
-    effective_limit = line_limit if line_limit is not None else limit
-    return read_files_impl(
-        targets,
-        offset=effective_offset,
-        limit=effective_limit,
-        max_lines=200,
-        max_bytes=32768,
-    )
 
 
 @mcp.tool(
@@ -441,10 +334,6 @@ async def server_info() -> dict[str, object]:
         "claude_command": CLAUDE_COMMAND,
         "tools": tools,
         "tool_count": len(tools),
-        "tool_aliases": {
-            "search": ["search_files", "glob_files", "grep_files"],
-            "read_text": ["read_file", "read_files"],
-        },
     }
 
 
