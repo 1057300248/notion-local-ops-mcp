@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import mimetypes
 import os
 import subprocess
 from fnmatch import fnmatch
@@ -304,12 +305,21 @@ def read_file(
         content = encoded[:max_bytes].decode("utf-8", errors="ignore")
         truncated = True
 
+    language = (mimetypes.guess_type(str(path))[0] or "").split("/")[-1] or path.suffix.lstrip(".")
+    if not language:
+        language = "text"
+    end_line = start + len(selected) - 1 if selected else start - 1
+
     return {
         "success": True,
         "path": str(path),
         "content": content,
         "truncated": truncated,
         "next_offset": start + len(selected) if truncated and selected else None,
+        "offset_unit": "lines",
+        "start_line": start,
+        "end_line": end_line,
+        "language": language,
     }
 
 
@@ -331,13 +341,16 @@ def read_files(
     }
 
 
-def write_file(path: Path, *, content: str) -> dict[str, object]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+def write_file(path: Path, *, content: str, dry_run: bool = False) -> dict[str, object]:
+    if not dry_run:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
     return {
         "success": True,
         "path": str(path),
         "bytes_written": len(content.encode("utf-8")),
+        "dry_run": dry_run,
+        "written": not dry_run,
     }
 
 
@@ -396,6 +409,7 @@ def replace_in_file(
     old_text: str,
     new_text: str,
     replace_all: bool = False,
+    dry_run: bool = False,
 ) -> dict[str, object]:
     if not path.exists():
         return _error("file_not_found", f"File not found: {path}", resolved_path=str(path))
@@ -435,9 +449,13 @@ def replace_in_file(
         )
 
     replacements = occurrences if replace_all else 1
-    path.write_text(original.replace(old_text, new_text, replacements), encoding="utf-8")
+    replaced = original.replace(old_text, new_text, replacements)
+    if not dry_run:
+        path.write_text(replaced, encoding="utf-8")
     return {
         "success": True,
         "path": str(path),
         "replacements": replacements,
+        "dry_run": dry_run,
+        "written": not dry_run,
     }

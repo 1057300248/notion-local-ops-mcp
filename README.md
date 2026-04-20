@@ -46,15 +46,16 @@ Act like a coding agent, not a Notion page editor.
 When the context contains repo paths, filenames, code extensions, README, AGENTS.md, CLAUDE.md, or .cursorrules, treat "document", "file", "notes", and "instructions" as local files unless the user explicitly says Notion page, wiki, or workspace page.
 For local file changes, do not use <edit_reference>. Use local file tools and, when useful, verify with git_diff, git_status, or tests.
 Use list_skills when the user asks about available skills or agent capabilities.
-Use direct tools first: glob_files, grep_files, read_file, read_files, replace_in_file, write_file, apply_patch, git_status, git_diff, git_commit, git_log, run_command.
+Use direct tools first: server_info, set_default_cwd/get_default_cwd, glob_files, grep_files, read_file, read_files, replace_in_file, write_file, apply_patch, git_status, git_diff, git_commit, git_log, git_show, git_blame, run_command.
 Use list_files only when directory structure itself matters, and paginate with limit/offset instead of assuming full output.
 Use search_files only for simple substring search when regex or context is unnecessary.
-Use read_files when you need a few files at once after search or glob discovery.
+Use read_file/read_files with start_line/line_limit for line-based pagination and stable cursoring.
 Use apply_patch for multi-change edits, same-file multi-location edits, file moves, deletes, or creates. Use dry_run=true, validate_only=true, or return_diff=true when you want validation or a preview before writing.
-Use replace_in_file only for one small exact edit or clearly intentional replace_all edits.
+Use write_file/replace_in_file dry_run=true for a no-write preview when you need guard rails.
 Do not issue parallel writes to the same file.
-Use git_status, git_diff, git_commit, and git_log for repository state and traceability instead of raw git shell commands when possible.
-Use run_command for verification, tests, builds, rg, pwd, ls, and other non-git shell work. If a command may take longer, set run_in_background=true and follow with get_task or wait_task.
+Use git_status, git_diff, git_commit, git_log, git_show, and git_blame for repository state and traceability instead of raw git shell commands when possible.
+Use run_command for quick shell work. For stream-like long jobs, prefer run_command_stream (or run_command with run_in_background=true) and follow with get_task/wait_task.
+Use purge_tasks periodically to clean old task logs (older_than_hours, dry_run=true first).
 Use delegate_task only when direct tools are insufficient for complex multi-file reasoning, long-running fallback execution, or repeated failed attempts with direct tools. When delegating non-trivial work, pass goal, acceptance_criteria, verification_commands, and commit_mode.
 After each logically meaningful change, create a small focused git commit so progress stays traceable. Keep unrelated changes out of the same commit.
 ```
@@ -89,21 +90,24 @@ Working style:
 
 Tool strategy:
 - list_skills: use when the user asks what skills are available in this repo or globally.
+- server_info: call first when troubleshooting connection/runtime mismatches.
+- set_default_cwd / get_default_cwd: set once for repeated repo operations instead of passing cwd every time.
 - In coding tasks, search the local repo first. Do not default to searching the Notion workspace.
 - glob_files: narrow candidate paths by pattern.
 - grep_files: search code or text with regex, glob filtering, and output modes.
 - list_files: inspect directory structure only when structure matters; paginate with limit and offset when needed.
 - search_files: use only for simple substring search when regex or context is unnecessary.
-- read_file: read relevant file sections before editing.
-- read_files: batch read a few files after search or glob discovery.
-- replace_in_file: make one small exact edit; use replace_all only when clearly intended.
+- read_file / read_files: read relevant file sections with line-based pagination (start_line/line_limit preferred; offset/limit is legacy alias).
+- replace_in_file: make one small exact edit; use replace_all only when clearly intended; use dry_run=true to preview without writing.
 - apply_patch: prefer this for multi-hunk edits, same-file multi-location edits, moves, deletes, or adds in one patch. Use dry_run=true, validate_only=true, or return_diff=true when you want validation or a preview before writing.
-- write_file: create new files or rewrite short files when that is simpler than patching.
-- git_status / git_diff / git_commit / git_log: use these as the default repository workflow and traceability tools.
-- run_command: proactively use for non-destructive commands such as pwd, ls, rg, tests, builds, or smoke checks; set run_in_background=true for longer jobs.
+- write_file: create new files or rewrite short files when that is simpler than patching; use dry_run=true for no-write preview.
+- git_status / git_diff / git_commit / git_log / git_show / git_blame: use these as the default repository workflow and traceability tools.
+- run_command: proactively use for non-destructive commands such as pwd, ls, rg, tests, builds, or smoke checks.
+- run_command_stream: start long-running shell jobs with immediate task_id return for polling progress.
 - delegate_task: use only for complex multi-file reasoning, long-running fallback execution, or repeated failed attempts with direct tools by local codex or claude-code. For non-trivial work, pass goal, acceptance_criteria, verification_commands, and commit_mode.
 - get_task / wait_task: check delegated task or background command status; prefer wait_task when blocking is useful.
 - cancel_task: stop a delegated task if needed.
+- purge_tasks: garbage-collect stale task artifacts under STATE_DIR/tasks (dry_run first).
 
 Execution rules:
 - When exploring a codebase, prefer glob_files and grep_files over broad list_files calls.
@@ -190,8 +194,7 @@ cd notion-local-ops-mcp
 
 python3.11 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
-pip install -e .
+pip install -e ".[dev]"
 ```
 
 ### Configure
@@ -209,7 +212,7 @@ Optional:
 ```bash
 NOTION_LOCAL_OPS_CODEX_COMMAND="codex"
 NOTION_LOCAL_OPS_CLAUDE_COMMAND="claude"
-NOTION_LOCAL_OPS_COMMAND_TIMEOUT="30"
+NOTION_LOCAL_OPS_COMMAND_TIMEOUT="120"
 NOTION_LOCAL_OPS_DELEGATE_TIMEOUT="1800"
 ```
 
@@ -289,30 +292,37 @@ cloudflared tunnel --config ./cloudflared-example.yml run <your-tunnel-name>
 | `NOTION_LOCAL_OPS_TUNNEL_NAME` | no | empty |
 | `NOTION_LOCAL_OPS_CODEX_COMMAND` | no | `codex` |
 | `NOTION_LOCAL_OPS_CLAUDE_COMMAND` | no | `claude` |
-| `NOTION_LOCAL_OPS_COMMAND_TIMEOUT` | no | `30` |
+| `NOTION_LOCAL_OPS_COMMAND_TIMEOUT` | no | `120` |
 | `NOTION_LOCAL_OPS_DELEGATE_TIMEOUT` | no | `1800` |
 
 ## MCP Tools
 
-- `list_files`: list files and directories, with `limit` and `offset` pagination
+- `list_files`: list files and directories with pagination; excludes hidden/junk dirs and respects `.gitignore` by default
 - `list_skills`: discover project and global skills with name and description summaries
 - `glob_files`: find files or directories by glob pattern
 - `grep_files`: advanced regex search with glob filtering and output modes
 - `search_files`: simple substring search for backward compatibility
-- `read_file`: read text files with offset and limit
-- `read_files`: read a batch of text files with shared offset and limit
-- `replace_in_file`: replace one exact text fragment or all exact matches
-- `write_file`: write full file content
+- `read_file`: read text files with line-based pagination (`start_line`/`line_limit`, legacy `offset`/`limit`), plus `language` hint
+- `read_files`: read a batch of text files with the same line-based pagination options
+- `replace_in_file`: replace one exact text fragment or all exact matches, supports `dry_run`
+- `write_file`: write full file content, supports `dry_run`
 - `apply_patch`: apply codex-style add/update/move/delete patches, with `dry_run`, `validate_only`, and optional diff output
+- `server_info`: inspect runtime config and the registered MCP tool list
+- `set_default_cwd`: set session default working directory for subsequent calls
+- `get_default_cwd`: inspect current session/effective working directory
 - `git_status`: structured repository status
-- `git_diff`: structured diff output with changed file paths
-- `git_commit`: stage selected paths or all changes and create a commit
+- `git_diff`: structured diff output grouped by file with per-file truncation
+- `git_commit`: stage selected paths or all changes and create a commit (`amend` / `allow_empty` / `author` / `sign_off` / `dry_run`)
 - `git_log`: recent commit history
+- `git_show`: inspect metadata and per-file diff for a commit/ref
+- `git_blame`: line-level blame metadata for a file/range
 - `run_command`: run local shell commands, optionally in background
+- `run_command_stream`: start a background shell job and poll output by task id
 - `delegate_task`: send a task to local `codex` or `claude-code`, with optional `goal`, `acceptance_criteria`, `verification_commands`, and `commit_mode`
 - `get_task`: read task status and output tail
 - `wait_task`: block until a delegated or background shell task completes or times out
 - `cancel_task`: stop a delegated or background shell task
+- `purge_tasks`: clean old task artifacts from `STATE_DIR/tasks` with dry-run support
 
 ## Verify
 

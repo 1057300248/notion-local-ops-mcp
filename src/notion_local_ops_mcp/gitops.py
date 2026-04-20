@@ -241,6 +241,7 @@ def git_commit(
     allow_empty: bool = False,
     author: str | None = None,
     sign_off: bool = False,
+    dry_run: bool = False,
 ) -> dict[str, object]:
     repo_info = _require_repo(cwd)
     if isinstance(repo_info, dict):
@@ -249,17 +250,28 @@ def git_commit(
     normalized_paths = [_normalize_pathspec(path, cwd=cwd, repo_root=repo_root) for path in (paths or [])]
 
     if stage_all:
-        stage_result = _run_git(["add", "-A"], cwd=cwd)
-        if stage_result.returncode != 0:
-            return _error("git_add_failed", stage_result.stderr.strip() or "git add -A failed.", cwd=str(cwd))
+        if not dry_run:
+            stage_result = _run_git(["add", "-A"], cwd=cwd)
+            if stage_result.returncode != 0:
+                return _error("git_add_failed", stage_result.stderr.strip() or "git add -A failed.", cwd=str(cwd))
     elif normalized_paths:
-        stage_result = _run_git(["add", "--", *normalized_paths], cwd=cwd)
-        if stage_result.returncode != 0:
-            return _error("git_add_failed", stage_result.stderr.strip() or "git add failed.", cwd=str(cwd))
+        if not dry_run:
+            stage_result = _run_git(["add", "--", *normalized_paths], cwd=cwd)
+            if stage_result.returncode != 0:
+                return _error("git_add_failed", stage_result.stderr.strip() or "git add failed.", cwd=str(cwd))
 
     staged_result = _run_git(["diff", "--cached", "--name-only"], cwd=cwd)
     staged_files = [line for line in staged_result.stdout.splitlines() if line]
-    if not staged_files and not allow_empty and not amend:
+    would_stage_files: list[str] = []
+    if stage_all:
+        pending = _run_git(["status", "--porcelain"], cwd=cwd)
+        would_stage_files = [line[3:].split(" -> ", 1)[-1] for line in pending.stdout.splitlines() if line]
+    elif normalized_paths:
+        would_stage_files = normalized_paths
+
+    effective_files = staged_files + [item for item in would_stage_files if item not in staged_files]
+
+    if not effective_files and not allow_empty and not amend:
         return _error("nothing_to_commit", "No staged changes to commit.", cwd=str(cwd))
 
     commit_args = ["commit", "-m", message]
@@ -271,6 +283,22 @@ def git_commit(
         commit_args.extend(["--author", author])
     if sign_off:
         commit_args.append("--signoff")
+
+    if dry_run:
+        return {
+            "success": True,
+            "cwd": str(cwd),
+            "repo_root": str(repo_root),
+            "branch": branch,
+            "summary": message,
+            "files": effective_files,
+            "amended": amend,
+            "allow_empty": allow_empty,
+            "dry_run": True,
+            "would_stage": would_stage_files,
+            "commit_args": commit_args,
+        }
+
     commit_result = _run_git(commit_args, cwd=cwd)
     if commit_result.returncode != 0:
         return _error(
@@ -302,6 +330,7 @@ def git_commit(
         "files": committed_files,
         "amended": amend,
         "allow_empty": allow_empty,
+        "dry_run": False,
     }
 
 

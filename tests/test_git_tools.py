@@ -169,6 +169,25 @@ def test_git_commit_rejects_empty_when_allow_empty_false(tmp_path: Path) -> None
     assert result["error"]["code"] == "nothing_to_commit"
 
 
+def test_git_commit_dry_run_reports_plan_without_creating_commit(tmp_path: Path) -> None:
+    _init_repo(tmp_path)
+    target = tmp_path / "note.txt"
+    target.write_text("v1\n", encoding="utf-8")
+
+    result = git_commit(
+        cwd=tmp_path,
+        message="feat: dry run",
+        paths=["note.txt"],
+        dry_run=True,
+    )
+
+    assert result["success"] is True
+    assert result["dry_run"] is True
+    assert result["summary"] == "feat: dry run"
+    assert "note.txt" in result["files"]
+    assert "commit" not in result
+
+
 def test_git_commit_respects_custom_author(tmp_path: Path) -> None:
     _init_repo(tmp_path)
     (tmp_path / "file.txt").write_text("x\n", encoding="utf-8")

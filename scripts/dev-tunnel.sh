@@ -149,7 +149,6 @@ import fastmcp
 import uvicorn
 PY
 then
-  python -m pip install -r requirements.txt
   python -m pip install -e .
 fi
 

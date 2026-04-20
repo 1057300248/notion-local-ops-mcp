@@ -32,6 +32,8 @@ def test_server_info_reports_metadata_and_tools() -> None:
         "git_show",
         "git_blame",
         "delegate_task",
+        "run_command_stream",
+        "purge_tasks",
     ]:
         assert name in tools, f"expected {name} in tools list"
     assert payload["tool_count"] == len(tools)

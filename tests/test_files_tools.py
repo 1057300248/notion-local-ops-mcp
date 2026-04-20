@@ -132,6 +132,20 @@ def test_read_files_returns_multiple_results_in_order(tmp_path: Path) -> None:
     assert [item["content"] for item in result["results"]] == ["alpha", "gamma"]
 
 
+def test_read_file_reports_line_unit_and_language(tmp_path: Path) -> None:
+    target = tmp_path / "app.py"
+    target.write_text("one\ntwo\nthree\n", encoding="utf-8")
+
+    result = read_file(target, offset=2, limit=1, max_lines=50, max_bytes=4096)
+
+    assert result["success"] is True
+    assert result["content"] == "two"
+    assert result["offset_unit"] == "lines"
+    assert result["start_line"] == 2
+    assert result["end_line"] == 2
+    assert result["language"] in {"python", "x-python"}
+
+
 def test_write_file_creates_parent_directories(tmp_path: Path) -> None:
     target = tmp_path / "deep" / "file.txt"
 
@@ -140,6 +154,17 @@ def test_write_file_creates_parent_directories(tmp_path: Path) -> None:
     assert result["success"] is True
     assert target.read_text(encoding="utf-8") == "hello"
     assert result["bytes_written"] == 5
+
+
+def test_write_file_dry_run_does_not_touch_disk(tmp_path: Path) -> None:
+    target = tmp_path / "deep" / "file.txt"
+
+    result = write_file(target, content="hello", dry_run=True)
+
+    assert result["success"] is True
+    assert result["dry_run"] is True
+    assert result["written"] is False
+    assert target.exists() is False
 
 
 def test_replace_in_file_requires_unique_match(tmp_path: Path) -> None:
@@ -204,3 +229,15 @@ def test_replace_in_file_can_replace_all_matches(tmp_path: Path) -> None:
     assert result["success"] is True
     assert target.read_text(encoding="utf-8") == "after\nafter\n"
     assert result["replacements"] == 2
+
+
+def test_replace_in_file_dry_run_keeps_original_content(tmp_path: Path) -> None:
+    target = tmp_path / "app.py"
+    target.write_text("before\n", encoding="utf-8")
+
+    result = replace_in_file(target, old_text="before", new_text="after", dry_run=True)
+
+    assert result["success"] is True
+    assert result["dry_run"] is True
+    assert result["written"] is False
+    assert target.read_text(encoding="utf-8") == "before\n"

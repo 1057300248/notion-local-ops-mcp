@@ -179,47 +179,81 @@ def grep_files(
 
 @mcp.tool(
     name="read_file",
-    description="Read a text file with optional offset and limit.",
+    description=(
+        "Read a text file using line-based pagination. Use start_line/line_limit "
+        "for clarity (offset/limit remain for backward compatibility)."
+    ),
 )
-def read_file(path: str, offset: int | None = None, limit: int | None = None) -> dict[str, object]:
+def read_file(
+    path: str,
+    offset: int | None = None,
+    limit: int | None = None,
+    start_line: int | None = None,
+    line_limit: int | None = None,
+) -> dict[str, object]:
     target = resolve_path(path, WORKSPACE_ROOT)
-    return read_file_impl(target, offset=offset, limit=limit, max_lines=200, max_bytes=32768)
+    effective_offset = start_line if start_line is not None else offset
+    effective_limit = line_limit if line_limit is not None else limit
+    return read_file_impl(target, offset=effective_offset, limit=effective_limit, max_lines=200, max_bytes=32768)
 
 
 @mcp.tool(
     name="read_files",
-    description="Read multiple text files with the same optional offset and limit.",
+    description=(
+        "Batch read text files with shared line-based pagination. "
+        "Use start_line/line_limit (offset/limit kept for backward compatibility)."
+    ),
 )
 def read_files(
     paths: list[str],
     offset: int | None = None,
     limit: int | None = None,
+    start_line: int | None = None,
+    line_limit: int | None = None,
 ) -> dict[str, object]:
     targets = [resolve_path(path, WORKSPACE_ROOT) for path in paths]
-    return read_files_impl(targets, offset=offset, limit=limit, max_lines=200, max_bytes=32768)
+    effective_offset = start_line if start_line is not None else offset
+    effective_limit = line_limit if line_limit is not None else limit
+    return read_files_impl(
+        targets,
+        offset=effective_offset,
+        limit=effective_limit,
+        max_lines=200,
+        max_bytes=32768,
+    )
 
 
 @mcp.tool(
     name="replace_in_file",
-    description="Replace an exact text fragment in a file. Can replace one unique match or all matches.",
+    description=(
+        "Replace an exact text fragment in a file. Supports one unique match or "
+        "replace_all, plus dry_run preview without writing."
+    ),
 )
 def replace_in_file(
     path: str,
     old_text: str,
     new_text: str,
     replace_all: bool = False,
+    dry_run: bool = False,
 ) -> dict[str, object]:
     target = resolve_path(path, WORKSPACE_ROOT)
-    return replace_in_file_impl(target, old_text=old_text, new_text=new_text, replace_all=replace_all)
+    return replace_in_file_impl(
+        target,
+        old_text=old_text,
+        new_text=new_text,
+        replace_all=replace_all,
+        dry_run=dry_run,
+    )
 
 
 @mcp.tool(
     name="write_file",
-    description="Write full content to a file, creating parent directories when needed.",
+    description="Write full content to a file (supports dry_run preview without touching disk).",
 )
-def write_file(path: str, content: str) -> dict[str, object]:
+def write_file(path: str, content: str, dry_run: bool = False) -> dict[str, object]:
     target = resolve_path(path, WORKSPACE_ROOT)
-    return write_file_impl(target, content=content)
+    return write_file_impl(target, content=content, dry_run=dry_run)
 
 
 @mcp.tool(
@@ -375,7 +409,7 @@ def git_diff(
     description=(
         "Create a git commit for staged changes, selected paths, or all current changes. "
         "Supports amend (rewrite HEAD), allow_empty (commit without changes), custom author, "
-        "and sign_off (append Signed-off-by trailer)."
+        "sign_off (append Signed-off-by trailer), and dry_run preview."
     ),
 )
 def git_commit(
@@ -387,6 +421,7 @@ def git_commit(
     allow_empty: bool = False,
     author: str | None = None,
     sign_off: bool = False,
+    dry_run: bool = False,
 ) -> dict[str, object]:
     resolved_cwd = resolve_cwd(cwd, WORKSPACE_ROOT)
     return git_commit_impl(
@@ -398,6 +433,7 @@ def git_commit(
         allow_empty=allow_empty,
         author=author,
         sign_off=sign_off,
+        dry_run=dry_run,
     )
 
 
@@ -482,10 +518,36 @@ def run_command(
 
 
 @mcp.tool(
+    name="run_command_stream",
+    description=(
+        "Start a shell command in background and return task_id immediately for "
+        "stream-like polling via get_task/wait_task."
+    ),
+)
+def run_command_stream(
+    command: str,
+    cwd: str | None = None,
+    timeout: int | None = None,
+) -> dict[str, object]:
+    resolved_cwd = resolve_cwd(cwd, WORKSPACE_ROOT)
+    effective_timeout = timeout if timeout is not None else COMMAND_TIMEOUT
+    queued = registry.submit_command(
+        command=command,
+        cwd=resolved_cwd,
+        timeout=effective_timeout,
+    )
+    queued["stream_mode"] = "task-polling"
+    queued["next"] = "call get_task(task_id) or wait_task(task_id)"
+    return queued
+
+
+@mcp.tool(
     name="delegate_task",
     description=(
         "Fallback only. Use this when direct tools are insufficient for a complex, long-running, or "
-        "multi-file task. Supported executors: auto, codex, claude-code."
+        "multi-file task. Supported executors: auto, codex, claude-code. "
+        "Optionally provide output_schema and parse_structured_output=true to "
+        "capture JSON output as structured_output."
     ),
 )
 def delegate_task(
@@ -498,6 +560,8 @@ def delegate_task(
     verification_commands: list[str] | None = None,
     commit_mode: str = "allowed",
     timeout: int | None = None,
+    output_schema: dict[str, object] | None = None,
+    parse_structured_output: bool = True,
 ) -> dict[str, object]:
     resolved_cwd = resolve_cwd(cwd, WORKSPACE_ROOT)
     return registry.submit(
@@ -510,6 +574,8 @@ def delegate_task(
         acceptance_criteria=acceptance_criteria,
         verification_commands=verification_commands,
         commit_mode=commit_mode,
+        output_schema=output_schema,
+        parse_structured_output=parse_structured_output,
     )
 
 
@@ -535,6 +601,20 @@ def wait_task(task_id: str, timeout: float = 30, poll_interval: float = 0.5) -> 
 )
 def cancel_task(task_id: str) -> dict[str, object]:
     return registry.cancel(task_id)
+
+
+@mcp.tool(
+    name="purge_tasks",
+    description=(
+        "Delete old task metadata/log directories under STATE_DIR/tasks. "
+        "Defaults to 7 days; supports dry_run preview."
+    ),
+)
+def purge_tasks(older_than_hours: float = 24 * 7, dry_run: bool = False) -> dict[str, object]:
+    return store.purge_tasks(
+        older_than_seconds=max(float(older_than_hours), 0.0) * 3600.0,
+        dry_run=dry_run,
+    )
 
 
 def build_http_app():

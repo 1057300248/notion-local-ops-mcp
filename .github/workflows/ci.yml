@@ -8,7 +8,7 @@ on:
 
 jobs:
   pytest:
-    name: pytest (py{{ matrix.python }})
+    name: pytest (py${{ matrix.python }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -20,7 +20,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: {{ matrix.python }}
+          python-version: ${{ matrix.python }}
           cache: pip
 
       - name: Install (editable + dev extras)

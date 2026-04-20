@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -65,6 +67,32 @@ def _summarize(stdout: str, stderr: str) -> str:
         if candidate:
             return candidate.splitlines()[-1]
     return ""
+
+
+_JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
+
+
+def _extract_structured_output(text: str) -> object | None:
+    """Best-effort JSON extraction from tool output."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return None
+
+    # Prefer the last fenced json block if present.
+    matches = _JSON_BLOCK_RE.findall(stripped)
+    if matches:
+        candidate = matches[-1].strip()
+        if candidate:
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                pass
+
+    # Fallback: entire payload is JSON.
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
 
 
 def _cwd_error(command: str, cwd: Path) -> dict[str, object] | None:
@@ -133,6 +161,8 @@ class ExecutorRegistry:
         acceptance_criteria: list[str] | None = None,
         verification_commands: list[str] | None = None,
         commit_mode: str = "allowed",
+        output_schema: dict[str, object] | None = None,
+        parse_structured_output: bool = True,
     ) -> dict[str, object]:
         normalized_task = (task or "").strip()
         normalized_goal = (goal or "").strip()
@@ -153,6 +183,8 @@ class ExecutorRegistry:
                 "acceptance_criteria": acceptance_criteria or [],
                 "verification_commands": verification_commands or [],
                 "commit_mode": commit_mode,
+                "output_schema": output_schema or None,
+                "parse_structured_output": parse_structured_output,
             },
         )
         cancel_event = threading.Event()
@@ -173,6 +205,8 @@ class ExecutorRegistry:
                 acceptance_criteria or [],
                 verification_commands or [],
                 commit_mode,
+                output_schema or None,
+                parse_structured_output,
             ),
             daemon=True,
         )
@@ -307,6 +341,8 @@ class ExecutorRegistry:
         acceptance_criteria: list[str],
         verification_commands: list[str],
         commit_mode: str,
+        output_schema: dict[str, object] | None,
+        parse_structured_output: bool,
     ) -> None:
         try:
             self._run_task_impl(
@@ -322,6 +358,8 @@ class ExecutorRegistry:
                 acceptance_criteria,
                 verification_commands,
                 commit_mode,
+                output_schema,
+                parse_structured_output,
             )
         finally:
             self._mark_completed(task_id)
@@ -340,6 +378,8 @@ class ExecutorRegistry:
         acceptance_criteria: list[str],
         verification_commands: list[str],
         commit_mode: str,
+        output_schema: dict[str, object] | None,
+        parse_structured_output: bool,
     ) -> None:
         if cancel_event.is_set():
             self.store.update(task_id, status="cancelled")
@@ -391,12 +431,22 @@ class ExecutorRegistry:
         self.store.write_logs(task_id, stdout=stdout, stderr=stderr)
         self.store.write_summary(task_id, _summarize(stdout, stderr))
 
+        structured_output = None
+        if parse_structured_output:
+            structured_output = _extract_structured_output(stdout) or _extract_structured_output(stderr)
+
         if cancel_event.is_set() or self.store.get(task_id)["status"] == "cancelled":
             self.store.update(task_id, status="cancelled")
             return
 
         status = "succeeded" if process.returncode == 0 else "failed"
-        self.store.update(task_id, status=status, exit_code=process.returncode)
+        self.store.update(
+            task_id,
+            status=status,
+            exit_code=process.returncode,
+            structured_output=structured_output,
+            output_schema=output_schema or None,
+        )
 
     def _run_command_task(
         self,
@@ -463,13 +513,14 @@ class ExecutorRegistry:
         stderr = _decode_output(stderr)
         self.store.write_logs(task_id, stdout=stdout, stderr=stderr)
         self.store.write_summary(task_id, _summarize(stdout, stderr))
+        structured_output = _extract_structured_output(stdout) or _extract_structured_output(stderr)
 
         if cancel_event.is_set() or self.store.get(task_id)["status"] == "cancelled":
             self.store.update(task_id, status="cancelled")
             return
 
         status = "succeeded" if process.returncode == 0 else "failed"
-        self.store.update(task_id, status=status, exit_code=process.returncode)
+        self.store.update(task_id, status=status, exit_code=process.returncode, structured_output=structured_output)
 
     def _build_invocation(
         self,

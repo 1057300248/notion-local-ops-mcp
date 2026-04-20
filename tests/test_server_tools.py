@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from notion_local_ops_mcp.executors import ExecutorRegistry
@@ -90,3 +91,58 @@ def test_server_delegate_task_accepts_structured_fields(tmp_path: Path) -> None:
     assert meta["acceptance_criteria"] == ["Tool returns structured status"]
     assert meta["verification_commands"] == ["pytest -q"]
     assert meta["commit_mode"] == "allowed"
+
+
+def test_server_run_command_stream_returns_task_polling_hint(tmp_path: Path) -> None:
+    from notion_local_ops_mcp import server
+
+    old_registry = server.registry
+    try:
+        server.registry = ExecutorRegistry(
+            store=TaskStore(tmp_path / "state"),
+            codex_command="python3 -c \"print('codex')\"",
+            claude_command="python3 -c \"print('claude')\"",
+        )
+
+        queued = server.run_command_stream(
+            command="python3 -c \"print('stream')\"",
+            cwd=str(tmp_path),
+            timeout=5,
+        )
+        result = server.wait_task(queued["task_id"], timeout=2, poll_interval=0.05)
+
+        assert queued["stream_mode"] == "task-polling"
+        assert "next" in queued
+        assert result["status"] == "succeeded"
+        assert "stream" in result["stdout_tail"]
+    finally:
+        server.registry = old_registry
+
+
+def test_server_purge_tasks_dry_run_reports_candidates(tmp_path: Path) -> None:
+    from notion_local_ops_mcp import server
+
+    old_store = server.store
+    old_registry = server.registry
+    try:
+        server.store = TaskStore(tmp_path / "state")
+        server.registry = ExecutorRegistry(
+            store=server.store,
+            codex_command="python3 -c \"print('codex')\"",
+            claude_command="python3 -c \"print('claude')\"",
+        )
+
+        created = server.store.create(task="old", executor="shell", cwd=str(tmp_path))
+        meta_path = server.store._task_dir(created["task_id"]) / "meta.json"  # noqa: SLF001
+        payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        payload["updated_at"] = "2000-01-01T00:00:00+00:00"
+        meta_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        result = server.purge_tasks(older_than_hours=1, dry_run=True)
+
+        assert result["success"] is True
+        assert result["purged"] == 1
+        assert created["task_id"] in result["task_ids"]
+    finally:
+        server.store = old_store
+        server.registry = old_registry
