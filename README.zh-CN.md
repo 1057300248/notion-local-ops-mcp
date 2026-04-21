@@ -153,7 +153,8 @@ NOTION_LOCAL_OPS_AUTH_TOKEN="replace-me"
 
 - 脚本创建或复用 `.venv`
 - 自动安装缺失的 Python 依赖
-- 本地 MCP 服务启动在 `http://127.0.0.1:8766/mcp`
+- 本地 MCP 服务通过一个平滑重载 supervisor 启动在 `http://127.0.0.1:8766/mcp`
+- 脚本会打印 `./scripts/dev-tunnel.sh reload`，用于不掉 tunnel 地重载本地服务
 - 优先使用 `cloudflared.local.yml` 命名 tunnel
 - 否则回退到 `cloudflared` quick tunnel，并打印公网 HTTPS 地址
 
@@ -187,6 +188,7 @@ NOTION_LOCAL_OPS_CODEX_COMMAND="codex"
 NOTION_LOCAL_OPS_CLAUDE_COMMAND="claude"
 NOTION_LOCAL_OPS_COMMAND_TIMEOUT="120"
 NOTION_LOCAL_OPS_DELEGATE_TIMEOUT="1800"
+NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS="30"
 ```
 
 ### 手动启动
@@ -215,7 +217,8 @@ http://127.0.0.1:8766/mcp
 - 复用或创建 `.venv`
 - 安装缺失的运行时依赖
 - 如果存在 `.env`，自动从仓库根目录加载
-- 启动 `notion-local-ops-mcp`
+- 在平滑重载 supervisor 后面启动 `notion-local-ops-mcp`
+- 通过 `./scripts/dev-tunnel.sh reload` 先拉起新进程、再排空旧进程，尽量避免 tunnel 短暂 502
 - 如果存在 `cloudflared.local.yml` 或 `cloudflared.local.yaml`，优先使用它
 - 否则自动打开一个 `cloudflared` quick tunnel
 
@@ -225,7 +228,18 @@ http://127.0.0.1:8766/mcp
 - `cloudflared.local.yml` 已加入 gitignore，所以你的本地 tunnel 配置也不会进 git
 - 如果 `NOTION_LOCAL_OPS_WORKSPACE_ROOT` 未设置，脚本会默认使用仓库根目录
 - 如果 `NOTION_LOCAL_OPS_AUTH_TOKEN` 未设置，脚本会直接报错退出，而不是猜测
+- `./scripts/dev-tunnel.sh reload` 会向 supervisor 发送 `SIGHUP`，在不丢公网 `/mcp` 入口的情况下滚动替换本地服务进程
 - 全新 clone 后，通常不需要先手动执行 `pip install`
+
+### 不掉 Tunnel 的平滑重载
+
+当 `./scripts/dev-tunnel.sh` 已经在一个终端或 tmux pane 里跑起来后，可以在另一个 shell 执行：
+
+```bash
+./scripts/dev-tunnel.sh reload
+```
+
+这个命令会保持 `cloudflared` 仍然连在同一个本地端口上，同时 supervisor 先拉起新的 MCP 服务、确认 ready，再让旧进程进入 drain。调试代码时，推荐优先用它而不是直接把整条 tunnel 会话杀掉。
 
 ### 用 cloudflared 暴露服务
 
@@ -268,6 +282,7 @@ cloudflared tunnel --config ./cloudflared-example.yml run <your-tunnel-name>
 | `NOTION_LOCAL_OPS_COMMAND_TIMEOUT` | 否 | `120` |
 | `NOTION_LOCAL_OPS_DELEGATE_TIMEOUT` | 否 | `1800` |
 | `NOTION_LOCAL_OPS_DEBUG_MCP_LOGGING` | 否 | `0` |
+| `NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS` | 否 | `30` |
 
 ## MCP 工具
 
@@ -308,6 +323,7 @@ NOTION_LOCAL_OPS_DEBUG_MCP_LOGGING=1 ./scripts/dev-tunnel.sh
 - session id 提示
 - JSON-RPC method
 - `tools/call` 的 tool 名
+- `tools/call.arguments` 的截断摘要
 - 响应状态码与耗时
 
 ## 验证
@@ -335,6 +351,7 @@ pytest -q tests/test_server_transport.py tests/test_concurrent_clients.py tests/
 - 确认鉴权类型是 `Bearer`
 - 确认 token 与 `NOTION_LOCAL_OPS_AUTH_TOKEN` 一致
 - 确认 `cloudflared` 仍在运行
+- 如果你在用户连接期间需要更新服务，优先使用 `./scripts/dev-tunnel.sh reload`，不要直接把整条 tunnel 会话杀掉
 
 ### 本地 `/mcp` 正常，但通过 tunnel 不通
 
@@ -345,6 +362,12 @@ pytest -q tests/test_server_transport.py tests/test_concurrent_clients.py tests/
 source .venv/bin/activate
 fastmcp list http://127.0.0.1:8766/mcp
 ```
+
+### 重启过程中 Notion 短暂看到 502
+
+- 重启时出现 Cloudflare 502，通常表示源站短暂不可用，不是 Cloudflare 在拦截
+- 如果这是在你手动杀 tmux pane 时发生的，改用 `./scripts/dev-tunnel.sh reload`，让 supervisor 以滚动替换方式重载服务
+- 查看最新的 `notion-local-ops-mcp-server.*.log`，确认新进程 ready 之后旧进程才开始 drain
 
 ### 日志里反复出现 404
 

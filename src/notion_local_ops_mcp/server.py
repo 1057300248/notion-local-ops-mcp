@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from fastmcp import FastMCP
+import argparse
+import os
 import re
+
+from fastmcp import FastMCP
 import uvicorn
 
 from .http_compat import build_http_compat_app
@@ -14,6 +17,7 @@ from .config import (
     COMMAND_TIMEOUT,
     DEBUG_MCP_LOGGING,
     DELEGATE_TIMEOUT,
+    GRACEFUL_SHUTDOWN_SECONDS,
     HOST,
     PORT,
     STATE_DIR,
@@ -91,6 +95,31 @@ def list_skills(
         workspace_root=WORKSPACE_ROOT,
         include_project=include_project,
         include_global=include_global,
+    )
+@mcp.tool(
+    name="list_skills",
+    description=(
+        "List project and global agent skills as lightweight summaries. "
+        "Returns skill name, description, preferred path, and source locations. "
+        "Use namespace ('agents' | 'codex' | 'claude') to scope, name_pattern "
+        "(fnmatch, e.g. 'git-*') to filter by skill name, and "
+        "description_max_length to cap long descriptions for index-style scans."
+    ),
+)
+def list_skills(
+    include_project: bool = True,
+    include_global: bool = True,
+    namespace: str | None = None,
+    name_pattern: str | None = None,
+    description_max_length: int | None = None,
+) -> dict[str, object]:
+    return list_skills_impl(
+        workspace_root=WORKSPACE_ROOT,
+        include_project=include_project,
+        include_global=include_global,
+        namespace=namespace,
+        name_pattern=name_pattern,
+        description_max_length=description_max_length,
     )
 
 
@@ -672,7 +701,60 @@ def build_http_app():
     )
 
 
-def main() -> None:
+class _ReadySignalServer(uvicorn.Server):
+    def __init__(self, config: uvicorn.Config, *, ready_fd: int | None) -> None:
+        super().__init__(config)
+        self._ready_fd = ready_fd
+
+    def _emit_ready(self) -> None:
+        if self._ready_fd is None:
+            return
+        os.write(self._ready_fd, b"ready\n")
+        os.close(self._ready_fd)
+        self._ready_fd = None
+
+    def _close_ready_fd(self) -> None:
+        if self._ready_fd is None:
+            return
+        os.close(self._ready_fd)
+        self._ready_fd = None
+
+    async def startup(self, sockets=None) -> None:
+        await super().startup(sockets=sockets)
+        if not self.should_exit:
+            self._emit_ready()
+
+    async def serve(self, sockets=None) -> None:
+        try:
+            await super().serve(sockets=sockets)
+        finally:
+            self._close_ready_fd()
+
+
+def _consume_ready_fd() -> int | None:
+    raw_value = os.environ.pop("NOTION_LOCAL_OPS_READY_FD", "").strip()
+    if not raw_value:
+        return None
+    return int(raw_value)
+
+
+def build_uvicorn_server(*, fd: int | None = None, ready_fd: int | None = None) -> uvicorn.Server:
+    app = build_http_app()
+    config = uvicorn.Config(
+        app,
+        host=HOST,
+        port=PORT,
+        fd=fd,
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,
+    )
+    return _ReadySignalServer(config, ready_fd=ready_fd)
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Run the notion-local-ops MCP server.")
+    parser.add_argument("--fd", type=int, default=None, help="Inherited listening socket fd.")
+    args = parser.parse_args(argv)
+
     ensure_runtime_directories()
     print(f"Starting {APP_NAME} on {HOST}:{PORT}")
     print(f"workspace_root={WORKSPACE_ROOT}")
@@ -680,8 +762,9 @@ def main() -> None:
     print("transport=streamable-http")
     print("mcp_path=/mcp")
     print(f"debug_mcp_logging={DEBUG_MCP_LOGGING}")
-    app = build_http_app()
-    uvicorn.run(app, host=HOST, port=PORT)
+    print(f"graceful_shutdown_seconds={GRACEFUL_SHUTDOWN_SECONDS}")
+    server = build_uvicorn_server(fd=args.fd, ready_fd=_consume_ready_fd())
+    server.run()
 
 
 if __name__ == "__main__":

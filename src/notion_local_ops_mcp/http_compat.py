@@ -101,6 +101,16 @@ def _extract_session_hint(scope: dict[str, Any]) -> str | None:
     return query_session or None
 
 
+def _truncate_jsonish(value: Any, *, max_chars: int = 240) -> str:
+    try:
+        rendered = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except TypeError:
+        rendered = repr(value)
+    if len(rendered) <= max_chars:
+        return rendered
+    return rendered[: max_chars - 1] + "…"
+
+
 def _summarize_rpc_body(body: bytes) -> dict[str, Any]:
     if not body:
         return {"kind": "empty"}
@@ -118,13 +128,21 @@ def _summarize_rpc_body(body: bytes) -> dict[str, Any]:
         method = item.get("method")
         params = item.get("params")
         tool_name = None
+        tool_args = None
+        params_summary = None
         if isinstance(params, dict):
             tool_name = params.get("name") or params.get("tool")
+            if "arguments" in params:
+                tool_args = _truncate_jsonish(params.get("arguments"))
+            else:
+                params_summary = _truncate_jsonish(params)
         entries.append(
             {
                 "id": item.get("id"),
                 "method": method,
                 "tool": tool_name,
+                "tool_args": tool_args,
+                "params_summary": params_summary,
             }
         )
     return {
@@ -133,28 +151,6 @@ def _summarize_rpc_body(body: bytes) -> dict[str, Any]:
         "count": len(items),
         "entries": entries,
     }
-
-
-async def _buffer_receive(receive: Any) -> tuple[bytes, Any]:
-    buffered_messages: list[dict[str, Any]] = []
-    body_parts: list[bytes] = []
-    while True:
-        message = await receive()
-        buffered_messages.append(message)
-        if message["type"] == "http.request":
-            body_parts.append(message.get("body", b""))
-            if not message.get("more_body", False):
-                break
-            continue
-        if message["type"] == "http.disconnect":
-            break
-
-    async def replay_receive() -> dict[str, Any]:
-        if buffered_messages:
-            return buffered_messages.pop(0)
-        return {"type": "http.request", "body": b"", "more_body": False}
-
-    return b"".join(body_parts), replay_receive
 
 
 class MCPDebugLoggingMiddleware:
@@ -197,24 +193,10 @@ class MCPDebugLoggingMiddleware:
         accept = headers.get("accept", "")
         request_id = hex(time.monotonic_ns())[-10:]
         rpc_summary: dict[str, Any] | None = None
-        body_bytes = b""
+        request_logged = False
+        body_parts: list[bytes] = []
 
-        if method in {"POST", "DELETE"}:
-            body_bytes, receive = await _buffer_receive(receive)
-            rpc_summary = _summarize_rpc_body(body_bytes)
-
-        if rpc_summary:
-            _emit_debug_log(
-                "MCP_DEBUG request_id=%s phase=request method=%s path=%s client=%s session=%s body_bytes=%s rpc=%s",
-                request_id,
-                method,
-                path,
-                client_host,
-                session_hint or "-",
-                len(body_bytes),
-                json.dumps(rpc_summary, ensure_ascii=False, separators=(",", ":")),
-            )
-        else:
+        if method not in {"POST", "DELETE"}:
             _emit_debug_log(
                 "MCP_DEBUG request_id=%s phase=request method=%s path=%s client=%s session=%s accept=%s",
                 request_id,
@@ -228,20 +210,56 @@ class MCPDebugLoggingMiddleware:
         status_code: int | None = None
         stream_logged = False
 
+        async def receive_wrapper() -> dict[str, Any]:
+            nonlocal request_logged, rpc_summary
+            message = await receive()
+            if method in {"POST", "DELETE"} and message["type"] == "http.request":
+                body_parts.append(message.get("body", b""))
+                if not message.get("more_body", False) and not request_logged:
+                    body_bytes = b"".join(body_parts)
+                    rpc_summary = _summarize_rpc_body(body_bytes)
+                    _emit_debug_log(
+                        "MCP_DEBUG request_id=%s phase=request method=%s path=%s client=%s session=%s body_bytes=%s rpc=%s",
+                        request_id,
+                        method,
+                        path,
+                        client_host,
+                        session_hint or "-",
+                        len(body_bytes),
+                        json.dumps(rpc_summary, ensure_ascii=False, separators=(",", ":")),
+                    )
+                    request_logged = True
+            elif method in {"POST", "DELETE"} and message["type"] == "http.disconnect" and not request_logged:
+                body_bytes = b"".join(body_parts)
+                rpc_summary = _summarize_rpc_body(body_bytes)
+                _emit_debug_log(
+                    "MCP_DEBUG request_id=%s phase=request_disconnected method=%s path=%s client=%s session=%s body_bytes=%s rpc=%s",
+                    request_id,
+                    method,
+                    path,
+                    client_host,
+                    session_hint or "-",
+                    len(body_bytes),
+                    json.dumps(rpc_summary, ensure_ascii=False, separators=(",", ":")),
+                )
+                request_logged = True
+            return message
+
         async def send_wrapper(message: dict[str, Any]) -> None:
             nonlocal status_code, stream_logged
             if message["type"] == "http.response.start":
                 status_code = int(message["status"])
                 if method == "GET" and "text/event-stream" in accept.lower():
                     stream_logged = True
-                    _emit_debug_log(
-                        "MCP_DEBUG request_id=%s phase=response_start method=%s path=%s session=%s status=%s stream=true",
-                        request_id,
-                        method,
-                        path,
-                        session_hint or "-",
-                        status_code,
-                    )
+                _emit_debug_log(
+                    "MCP_DEBUG request_id=%s phase=response_start method=%s path=%s session=%s status=%s stream=%s",
+                    request_id,
+                    method,
+                    path,
+                    session_hint or "-",
+                    status_code,
+                    stream_logged,
+                )
             elif message["type"] == "http.response.body" and not message.get("more_body", False):
                 duration_ms = round((time.monotonic() - started) * 1000, 1)
                 _emit_debug_log(
@@ -256,7 +274,7 @@ class MCPDebugLoggingMiddleware:
                 )
             await send(message)
 
-        await self.app(scope, receive, send_wrapper)
+        await self.app(scope, receive_wrapper, send_wrapper)
 
 
 class HTTPBearerAuthMiddleware:

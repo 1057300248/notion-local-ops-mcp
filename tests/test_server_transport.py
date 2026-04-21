@@ -260,4 +260,28 @@ def test_debug_logging_middleware_logs_rpc_method_and_preserves_body(caplog) -> 
     messages = [record.message for record in caplog.records if record.name == "notion_local_ops_mcp.mcp_debug"]
     assert any("phase=request" in message and '"method":"tools/call"' in message for message in messages)
     assert any('"tool":"search"' in message for message in messages)
+    assert any('"tool_args":"{\\"mode\\":\\"text\\",\\"query\\":\\"TODO\\"}"' in message for message in messages)
     assert any("phase=response_end" in message and "status=200" in message for message in messages)
+
+
+def test_http_app_debug_logging_does_not_break_streamable_http_initialize(tmp_path, monkeypatch) -> None:
+    from mcp.client.session import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+
+    monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    monkeypatch.setattr(server, "DEBUG_MCP_LOGGING", True)
+
+    with _running_server(tmp_path, monkeypatch) as url:
+
+        async def scenario() -> None:
+            headers = {"Authorization": "Bearer secret-token"}
+            async with httpx.AsyncClient(headers=headers, timeout=10.0) as client:
+                async with streamable_http_client(url, http_client=client) as (
+                    read_stream,
+                    write_stream,
+                    _,
+                ):
+                    async with ClientSession(read_stream, write_stream) as session:
+                        await session.initialize()
+
+        anyio.run(scenario)

@@ -153,7 +153,8 @@ What you should expect:
 
 - the script creates or reuses `.venv`
 - the script installs missing Python dependencies automatically
-- the script starts the local MCP server on `http://127.0.0.1:8766/mcp`
+- the script starts the local MCP server on `http://127.0.0.1:8766/mcp` through a rolling-reload supervisor
+- the script prints a `./scripts/dev-tunnel.sh reload` command so you can restart the local server without dropping the tunnel
 - the script prefers `cloudflared.local.yml` for a named tunnel
 - otherwise it falls back to a `cloudflared` quick tunnel and prints a public HTTPS URL
 
@@ -187,6 +188,7 @@ NOTION_LOCAL_OPS_CODEX_COMMAND="codex"
 NOTION_LOCAL_OPS_CLAUDE_COMMAND="claude"
 NOTION_LOCAL_OPS_COMMAND_TIMEOUT="120"
 NOTION_LOCAL_OPS_DELEGATE_TIMEOUT="1800"
+NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS="30"
 ```
 
 ### Manual Start
@@ -215,7 +217,8 @@ What it does:
 - reuses or creates `.venv`
 - installs missing runtime dependencies
 - loads `.env` from the repo root if present
-- starts `notion-local-ops-mcp`
+- starts `notion-local-ops-mcp` behind a rolling-reload supervisor
+- keeps the public tunnel stable while `./scripts/dev-tunnel.sh reload` swaps in a fresh server process
 - prefers `cloudflared.local.yml` or `cloudflared.local.yaml` if present
 - otherwise opens a `cloudflared` quick tunnel to your local server
 
@@ -225,7 +228,18 @@ Notes:
 - `cloudflared.local.yml` is gitignored, so your local named tunnel config stays out of git
 - if `NOTION_LOCAL_OPS_WORKSPACE_ROOT` is unset, the script defaults it to the repo root
 - if `NOTION_LOCAL_OPS_AUTH_TOKEN` is unset, the script exits with an error instead of guessing
+- `./scripts/dev-tunnel.sh reload` sends `SIGHUP` to the supervisor and rolls the server process without dropping the public `/mcp` endpoint
 - for a fresh clone, you do not need to run `pip install` manually before using this script
+
+### Rolling Reload Without Dropping The Tunnel
+
+Once `./scripts/dev-tunnel.sh` is already running in one terminal or tmux pane, use this from another shell:
+
+```bash
+./scripts/dev-tunnel.sh reload
+```
+
+This keeps `cloudflared` attached to the same local port while the supervisor starts a fresh MCP server process, waits for readiness, and then drains the old one. It is the recommended way to pick up code changes without causing transient 502 responses to Notion.
 
 ### Expose With cloudflared
 
@@ -268,6 +282,7 @@ cloudflared tunnel --config ./cloudflared-example.yml run <your-tunnel-name>
 | `NOTION_LOCAL_OPS_COMMAND_TIMEOUT` | no | `120` |
 | `NOTION_LOCAL_OPS_DELEGATE_TIMEOUT` | no | `1800` |
 | `NOTION_LOCAL_OPS_DEBUG_MCP_LOGGING` | no | `0` |
+| `NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS` | no | `30` |
 
 ## MCP Tools
 
@@ -308,6 +323,7 @@ When enabled, the server log includes `MCP_DEBUG` lines with:
 - session id hint
 - JSON-RPC method
 - tool name for `tools/call`
+- truncated `arguments` summary for `tools/call`
 - response status and duration
 
 ## Verify
@@ -335,6 +351,7 @@ pytest -q tests/test_server_transport.py tests/test_concurrent_clients.py tests/
 - Check the auth type is `Bearer`
 - Check the token matches `NOTION_LOCAL_OPS_AUTH_TOKEN`
 - Check `cloudflared` is still running
+- If you are updating the server while users are connected, prefer `./scripts/dev-tunnel.sh reload` over killing and restarting the whole tunnel session
 
 ### MCP endpoint works locally but not over tunnel
 
@@ -345,6 +362,12 @@ pytest -q tests/test_server_transport.py tests/test_concurrent_clients.py tests/
 source .venv/bin/activate
 fastmcp list http://127.0.0.1:8766/mcp
 ```
+
+### Notion saw a temporary 502 while you were restarting
+
+- A Cloudflare 502 during restart usually means the origin was briefly unavailable, not that Cloudflare blocked the request
+- If this happened while you manually killed the tmux pane, switch to `./scripts/dev-tunnel.sh reload` so the supervisor overlaps the new server with the old one
+- Check the newest `notion-local-ops-mcp-server.*.log` file to confirm the replacement process reached readiness before the old one drained
 
 ### Logs show repeated 404s
 

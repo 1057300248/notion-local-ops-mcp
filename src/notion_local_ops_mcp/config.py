@@ -54,6 +54,9 @@ CLAUDE_COMMAND = os.environ.get("NOTION_LOCAL_OPS_CLAUDE_COMMAND", "claude").str
 COMMAND_TIMEOUT = int(os.environ.get("NOTION_LOCAL_OPS_COMMAND_TIMEOUT", "120"))
 DELEGATE_TIMEOUT = int(os.environ.get("NOTION_LOCAL_OPS_DELEGATE_TIMEOUT", "1800"))
 DEBUG_MCP_LOGGING = _env_flag("NOTION_LOCAL_OPS_DEBUG_MCP_LOGGING", default=False)
+GRACEFUL_SHUTDOWN_SECONDS = int(
+    os.environ.get("NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS", "30")
+)
 
 
 def ensure_runtime_directories() -> None:

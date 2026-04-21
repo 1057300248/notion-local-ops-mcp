@@ -19,14 +19,15 @@ Notion Agent ──SSE──▶ FastMCP Server (uvicorn)
 
 ```
 src/notion_local_ops_mcp/
-├── server.py      # FastMCP app, tool registration, uvicorn entrypoint
+├── server.py      # FastMCP app, tool registration, uvicorn entrypoint / fd-aware child
 ├── config.py      # All env-var driven settings (host, port, paths, timeouts…)
 ├── pathing.py     # Path resolution: relative → absolute under WORKSPACE_ROOT
 ├── files.py       # list_files, read_text, write_file, internal replace helpers
 ├── search.py      # search implementations (glob/regex/text)
 ├── shell.py       # run_command — subprocess with timeout
 ├── tasks.py       # TaskStore — persistent task metadata & logs on disk
-└── executors.py   # ExecutorRegistry — async delegate_task via codex / claude-code
+├── executors.py   # ExecutorRegistry — async delegate_task via codex / claude-code
+└── supervisor.py  # Rolling-reload supervisor for dev-tunnel / local hot restarts
 ```
 
 ## Tools exposed
@@ -69,6 +70,7 @@ src/notion_local_ops_mcp/
 | `NOTION_LOCAL_OPS_COMMAND_TIMEOUT` | `120` | Default shell command timeout (seconds) |
 | `NOTION_LOCAL_OPS_DELEGATE_TIMEOUT` | `1800` | Default delegate task timeout (seconds) |
 | `NOTION_LOCAL_OPS_DEBUG_MCP_LOGGING` | `0` | Enable verbose MCP method/tool logging for handshake/debug sessions |
+| `NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS` | `30` | Graceful drain window when the rolling-reload supervisor swaps child servers |
 
 ## Quick start
 
@@ -76,7 +78,8 @@ src/notion_local_ops_mcp/
 cp .env.example .env   # edit values
 python -m venv .venv && source .venv/bin/activate
 pip install -e .
-notion-local-ops-mcp   # starts SSE server on :8766
+./scripts/dev-tunnel.sh
+# in another shell, use ./scripts/dev-tunnel.sh reload for rolling restarts
 ```
 
 ## Dev
