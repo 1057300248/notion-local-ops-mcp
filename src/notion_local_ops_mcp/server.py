@@ -84,22 +84,6 @@ def _current_debug_mcp_logging() -> bool:
     name="list_skills",
     description=(
         "List project and global agent skills as lightweight summaries. "
-        "Returns skill name, description, preferred path, and source locations."
-    ),
-)
-def list_skills(
-    include_project: bool = True,
-    include_global: bool = True,
-) -> dict[str, object]:
-    return list_skills_impl(
-        workspace_root=WORKSPACE_ROOT,
-        include_project=include_project,
-        include_global=include_global,
-    )
-@mcp.tool(
-    name="list_skills",
-    description=(
-        "List project and global agent skills as lightweight summaries. "
         "Returns skill name, description, preferred path, and source locations. "
         "Use namespace ('agents' | 'codex' | 'claude') to scope, name_pattern "
         "(fnmatch, e.g. 'git-*') to filter by skill name, and "
