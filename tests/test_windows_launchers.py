@@ -63,10 +63,12 @@ def _write_fake_cloudflared(
     tmp_path: Path,
     *,
     exit_first_after_seconds: float = 0.0,
+    port_base: int | None = None,
 ) -> tuple[Path, Path, int]:
     state_path = tmp_path / "fake-cloudflared-state.json"
     script_path = tmp_path / "fake_cloudflared.py"
-    port_base = _find_free_port()
+    if port_base is None:
+        port_base = _find_free_port()
 
     script_path.write_text(
         textwrap.dedent(
@@ -191,6 +193,7 @@ def _start_launcher(
     env: dict[str, str],
     *,
     base_port: int,
+    requested_count: int = 1,
     monitor_cycles: int = 8,
     monitor_interval_seconds: int = 1,
 ) -> subprocess.Popen[str]:
@@ -204,7 +207,7 @@ def _start_launcher(
             "-File",
             str(repo_root / "scripts" / "launch-mcp-manager.ps1"),
             "-RequestedCount",
-            "1",
+            str(requested_count),
             "-RequestedBasePort",
             str(base_port),
             "-NonInteractive",
@@ -261,6 +264,45 @@ def _wait_for_launcher_state(
         return None
 
     return _wait_for(_get_matching_instance, timeout=timeout, interval=interval)
+
+
+def _wait_for_launcher_instances(
+    launcher_state_path: Path,
+    *,
+    expected_count: int,
+    timeout: float = 40.0,
+) -> dict[str, object]:
+    def _get_ready_state() -> dict[str, object] | None:
+        state = _read_json(launcher_state_path)
+        if not state:
+            return None
+        instances = state.get("instances", [])
+        if not isinstance(instances, list) or len(instances) != expected_count:
+            return None
+        for item in instances:
+            if not isinstance(item, dict):
+                return None
+            if not (item.get("public_mcp_url") or item.get("mcp_url")):
+                return None
+        return state
+
+    return _wait_for(_get_ready_state, timeout=timeout, interval=0.5)
+
+
+def _process_exists(pid: int) -> bool:
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-Command",
+            f"if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    return completed.returncode == 0
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows-specific launcher smoke tests")
@@ -408,6 +450,80 @@ def test_launch_manager_restarts_server_and_tunnel_when_server_dies(tmp_path: Pa
         assert int(final_instance["cloudflared_pid"]) != initial_tunnel_pid
         assert str(final_instance["public_mcp_url"]) != initial_public_mcp_url
         assert "Local instance unhealthy" in str(final_instance["last_failure_reason"] or "") or final_instance["last_failure_reason"] == ""
+    finally:
+        _kill_process_tree(process.pid)
+        _cleanup_launcher_state(launcher_state_path)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-specific launcher smoke tests")
+def test_stop_script_closes_all_open_mcp_instances(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    base_port = _find_free_port()
+    fake_cloudflared_port_base = _find_free_port()
+    while fake_cloudflared_port_base in {base_port, base_port + 1}:
+        fake_cloudflared_port_base = _find_free_port()
+    fake_cloudflared, fake_cloudflared_state_path, fake_cloudflared_port_base = _write_fake_cloudflared(
+        tmp_path,
+        exit_first_after_seconds=0.0,
+        port_base=fake_cloudflared_port_base,
+    )
+    env, launcher_state_path, status_path = _launcher_env(
+        repo_root,
+        tmp_path,
+        fake_cloudflared,
+        fake_cloudflared_state_path,
+        fake_cloudflared_port_base,
+        0.0,
+        base_port,
+    )
+
+    process = _start_launcher(
+        repo_root,
+        env,
+        base_port=base_port,
+        requested_count=2,
+        monitor_cycles=0,
+        monitor_interval_seconds=1,
+    )
+    try:
+        state = _wait_for_launcher_instances(launcher_state_path, expected_count=2)
+        instances = state["instances"]
+        pids = {
+            int(item["server_pid"])
+            for item in instances
+            if isinstance(item, dict) and item.get("server_pid")
+        } | {
+            int(item["cloudflared_pid"])
+            for item in instances
+            if isinstance(item, dict) and item.get("cloudflared_pid")
+        }
+
+        stop_completed = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(repo_root / "scripts" / "stop-mcp-manager.ps1"),
+            ],
+            cwd=repo_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+        assert stop_completed.returncode == 0, stop_completed.stderr or stop_completed.stdout
+        process.wait(timeout=60)
+        assert process.returncode is not None
+        assert not launcher_state_path.exists()
+
+        status_text = status_path.read_text(encoding="utf-8")
+        assert "Notion Local MCP launcher stopped." in status_text
+
+        assert _wait_for(lambda: all(not _process_exists(pid) for pid in pids), timeout=30.0)
     finally:
         _kill_process_tree(process.pid)
         _cleanup_launcher_state(launcher_state_path)
