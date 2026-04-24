@@ -804,6 +804,7 @@ function New-ManagedInstanceRecord {
         LastPublicProbeMessage = ''
         LastRepairAction = ''
         ProbeWarmupCyclesRemaining = 0
+    }
 
     Initialize-InstanceLayout -Instance $instance
     return $instance
