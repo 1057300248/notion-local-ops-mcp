@@ -269,6 +269,7 @@ def test_run_task_decodes_utf8_process_output(tmp_path: Path, monkeypatch) -> No
         def __init__(self, *args, **kwargs) -> None:
             popen_kwargs.update(kwargs)
             self.returncode = 0
+            self.pid = 12345
             self.stdout = FakeStream(b"done \xe2\x98\x83\xff")
             self.stderr = FakeStream(b"warn \xff")
             self._polled = False
@@ -281,6 +282,9 @@ def test_run_task_decodes_utf8_process_output(tmp_path: Path, monkeypatch) -> No
 
         def kill(self) -> None:
             return None
+
+        def wait(self, timeout=None) -> int:
+            return 0
 
     monkeypatch.setattr(executors.subprocess, "Popen", FakeProcess)
 

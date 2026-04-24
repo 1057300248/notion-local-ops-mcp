@@ -29,6 +29,25 @@ def _split_command(command: str) -> list[str]:
     return shlex.split(command)
 
 
+def _kill_process(process: subprocess.Popen) -> None:
+    """Kill a process, using process-tree kill on Windows."""
+    if process.poll() is not None:
+        return
+    if IS_WINDOWS:
+        # shell=True on Windows means cmd.exe is the direct child;
+        # taskkill /T /F kills the entire process tree.
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(process.pid)],
+                capture_output=True,
+                timeout=10,
+            )
+            return
+        except Exception:
+            pass  # fall through to regular kill
+    process.kill()
+
+
 def _binary_name(binary: str) -> str:
     if IS_WINDOWS:
         return PureWindowsPath(binary).stem.lower()
@@ -192,9 +211,7 @@ class ExecutorRegistry:
                 "parse_structured_output": parse_structured_output,
             },
         )
-        cancel_event = threading.Event()
-        with self._lock:
-            self._cancel_events[created["task_id"]] = cancel_event
+        cancel_event, _ = self._register_task(created["task_id"])
         thread = threading.Thread(
             target=self._run_task,
             args=(
@@ -383,11 +400,19 @@ class ExecutorRegistry:
         """
         stdout_buf = bytearray()
         stderr_buf = bytearray()
+        # Track how many bytes have already been flushed to disk so we only
+        # append the new delta each interval — avoids O(n²) full rewrites.
+        flushed_out = 0
+        flushed_err = 0
         buf_lock = threading.Lock()
 
         def _reader(stream: object, buf: bytearray) -> None:
+            # Use read1() when available (BufferedReader) so we get data as
+            # soon as it arrives instead of blocking until the full 4096-byte
+            # buffer fills — critical for incremental streaming on Windows.
+            _read = getattr(stream, "read1", None) or stream.read  # type: ignore[union-attr]
             while True:
-                chunk = stream.read(4096)  # type: ignore[union-attr]
+                chunk = _read(4096)
                 if not chunk:
                     break
                 with buf_lock:
@@ -406,34 +431,47 @@ class ExecutorRegistry:
         poll_tick = min(0.05, interval)
         last_flush = time.monotonic()
 
+        def _flush_incremental() -> None:
+            nonlocal flushed_out, flushed_err
+            with buf_lock:
+                new_out = _decode_output(bytes(stdout_buf[flushed_out:]))
+                new_err = _decode_output(bytes(stderr_buf[flushed_err:]))
+                flushed_out = len(stdout_buf)
+                flushed_err = len(stderr_buf)
+            if new_out or new_err:
+                self.store.append_logs(task_id, stdout=new_out, stderr=new_err)
+            # Summary is cheap — always recompute from full buffers
+            with buf_lock:
+                so_full = _decode_output(bytes(stdout_buf))
+                se_full = _decode_output(bytes(stderr_buf))
+            self.store.write_summary(task_id, _summarize(so_full, se_full))
+
         while process.poll() is None:
             if cancel_event.is_set():
-                process.kill()
+                _kill_process(process)
                 break
             if time.monotonic() >= deadline:
-                process.kill()
+                _kill_process(process)
                 timed_out = True
                 break
             now = time.monotonic()
             if now - last_flush >= interval:
-                # Flush current output to disk so get_task sees live progress
-                with buf_lock:
-                    so = _decode_output(bytes(stdout_buf))
-                    se = _decode_output(bytes(stderr_buf))
-                self.store.write_logs(task_id, stdout=so, stderr=se)
-                self.store.write_summary(task_id, _summarize(so, se))
+                _flush_incremental()
                 last_flush = now
             time.sleep(poll_tick)
+
+        # Reap the child properly after kill
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
 
         # Wait for reader threads to drain remaining data
         t_out.join(timeout=5)
         t_err.join(timeout=5)
 
-        # Final flush
-        stdout = _decode_output(bytes(stdout_buf))
-        stderr = _decode_output(bytes(stderr_buf))
-        self.store.write_logs(task_id, stdout=stdout, stderr=stderr)
-        self.store.write_summary(task_id, _summarize(stdout, stderr))
+        # Final flush — append any remaining bytes
+        _flush_incremental()
 
         with self._lock:
             self._processes.pop(task_id, None)
@@ -442,6 +480,8 @@ class ExecutorRegistry:
             self.store.update(task_id, status="failed", timed_out=True)
             raise _StreamTimeout()
 
+        stdout = _decode_output(bytes(stdout_buf))
+        stderr = _decode_output(bytes(stderr_buf))
         return stdout, stderr
 
     def _run_task_impl(

@@ -64,7 +64,12 @@ else:
     HTTP_KEEPALIVE_TIMEOUT = None  # Unlimited keep-alive
 
 # Stream output interval in seconds for long-running tasks (default 0.5s)
-STREAM_OUTPUT_INTERVAL = float(os.environ.get("NOTION_LOCAL_OPS_STREAM_OUTPUT_INTERVAL", "0.5"))
+_raw_stream_interval = float(os.environ.get("NOTION_LOCAL_OPS_STREAM_OUTPUT_INTERVAL", "0.5"))
+if _raw_stream_interval <= 0:
+    raise ValueError(
+        f"NOTION_LOCAL_OPS_STREAM_OUTPUT_INTERVAL must be > 0, got {_raw_stream_interval}"
+    )
+STREAM_OUTPUT_INTERVAL = _raw_stream_interval
 
 
 def ensure_runtime_directories() -> None:
