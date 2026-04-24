@@ -1,4 +1,4 @@
-param(
+﻿param(
     [int]$DefaultCount = 1,
     [int]$DefaultBasePort = 8766,
     [int]$RequestedCount = 0,
@@ -977,21 +977,16 @@ function Invoke-PublicMcpProbe {
 
             # Classify: connection-level errors (TLS, DNS, socket) are transient
             # and should NOT count the same as a definitive HTTP error (404, 405).
-            $isTransient = $statusCode -eq 0 -and @(
-                '基础连接已经关闭',
-                '发送时发生错误',
-                '接收时发生错误',
-                'Unable to read data',
-                'Unable to write data',
-                'The connection was closed',
-                'SSL/TLS',
-                'secure channel',
-                'Could not create SSL/TLS',
-                'remote name could not be resolved',
-                'No such host',
-                'connection attempt failed',
-                'Operation timed out'
-            ) | Where-Object { $message.Contains($_) } | Measure-Object | Select-Object -ExpandProperty Count
+            $isTransient = $false
+            if ($statusCode -eq 0) {
+                $transientPatterns = @('The underlying connection was closed','An error occurred on a send','An error occurred on a receive','Unable to read data','Unable to write data','The connection was closed','SSL/TLS','secure channel','Could not create SSL/TLS','remote name could not be resolved','No such host','connection attempt failed','Operation timed out')
+                foreach ($p in $transientPatterns) {
+                    if ($message.Contains($p)) {
+                        $isTransient = $true
+                        break
+                    }
+                }
+            }
 
             if ($isTransient) {
                 # Transient connection error — don't retry with GET, it'll likely
