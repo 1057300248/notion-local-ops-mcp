@@ -520,6 +520,7 @@ function Convert-StateInstance {
         LastPublicProbeStatus = [string](Get-OptionalPropertyValue -Object $Item -Name 'last_public_probe_status' -Default 'unknown')
         LastPublicProbeMessage = [string](Get-OptionalPropertyValue -Object $Item -Name 'last_public_probe_message' -Default '')
         LastRepairAction = [string](Get-OptionalPropertyValue -Object $Item -Name 'last_repair_action' -Default '')
+        ProbeWarmupCyclesRemaining = [int](Get-OptionalPropertyValue -Object $Item -Name 'probe_warmup_cycles_remaining' -Default 0)
     }
 }
 
@@ -593,6 +594,7 @@ function Write-LauncherState {
                     last_public_probe_status = $_.LastPublicProbeStatus
                     last_public_probe_message = $_.LastPublicProbeMessage
                     last_repair_action = $_.LastRepairAction
+                    probe_warmup_cycles_remaining = $_.ProbeWarmupCyclesRemaining
                 }
             }
         )
@@ -801,7 +803,7 @@ function New-ManagedInstanceRecord {
         LastPublicProbeStatus = 'unknown'
         LastPublicProbeMessage = ''
         LastRepairAction = ''
-    }
+        ProbeWarmupCyclesRemaining = 0
 
     Initialize-InstanceLayout -Instance $instance
     return $instance
@@ -970,6 +972,43 @@ function Invoke-PublicMcpProbe {
     }
 }
 
+function Invoke-LocalMcpProbe {
+    param(
+        [pscustomobject]$Instance,
+        [int]$TimeoutSeconds = 3
+    )
+
+    $localMcpUrl = "http://$($Instance.Host):$($Instance.Port)/mcp"
+
+    try {
+        $response = Invoke-WebRequest -Uri $localMcpUrl -Method Head -UseBasicParsing -TimeoutSec $TimeoutSeconds
+        $statusCode = [int]$response.StatusCode
+        return [pscustomobject]@{
+            Success = ($statusCode -eq 200 -or $statusCode -eq 204)
+            StatusCode = $statusCode
+            Message = "HTTP $statusCode"
+        }
+    }
+    catch {
+        $statusCode = 0
+        $message = $_.Exception.Message
+        $response = $_.Exception.Response
+        if ($null -ne $response) {
+            try {
+                $statusCode = [int]$response.StatusCode.value__
+                $message = "HTTP $statusCode"
+            }
+            catch {
+            }
+        }
+        return [pscustomobject]@{
+            Success = $false
+            StatusCode = $statusCode
+            Message = $message
+        }
+    }
+}
+
 function Probe-LocalInstance {
     param([pscustomobject]$Instance)
 
@@ -1054,6 +1093,7 @@ function Repair-Instance {
         $Instance.LastPublicProbeStatus = 'pending'
         $Instance.LastPublicProbeMessage = 'waiting for next probe after repair'
         $Instance.LastFailureReason = ''
+        $Instance.ProbeWarmupCyclesRemaining = 3
         return $true
     }
     catch {
@@ -1071,6 +1111,9 @@ function Get-InstanceStatus {
 
     $status = if ($serverAlive -and $listening -and $Instance.LastPublicProbeStatus -eq 'ok') {
         'Running'
+    }
+    elseif ($serverAlive -and $listening -and $Instance.LastPublicProbeStatus -eq 'warmup') {
+        'Warmup'
     }
     elseif ($serverAlive -and $listening -and $Instance.LastPublicProbeStatus -eq 'failed') {
         'PublicProbeFail'
@@ -1102,6 +1145,7 @@ function Get-InstanceStatus {
         LastProbeAt = $Instance.LastProbeAt
         LastFailureReason = $Instance.LastFailureReason
         NeedsNotionUrlUpdate = $Instance.NeedsNotionUrlUpdate
+        ProbeWarmupCyclesRemaining = $Instance.ProbeWarmupCyclesRemaining
         ServerLog = $Instance.ServerLogPath
         CloudflaredStdoutLog = $Instance.CloudflaredStdoutLogPath
         CloudflaredStderrLog = $Instance.CloudflaredStderrLogPath
@@ -1157,6 +1201,9 @@ function Write-StatusSnapshot {
         $lines.Add(("  Last Probe At: {0}" -f $row.LastProbeAt))
         $lines.Add(("  Server PID: {0}" -f $row.ServerPID))
         $lines.Add(("  cloudflared PID: {0}" -f $row.TunnelPID))
+        if ($row.Status -eq 'Warmup') {
+            $lines.Add(("  Warm-up cycles remaining: {0}" -f $row.ProbeWarmupCyclesRemaining))
+        }
         if ($row.NeedsNotionUrlUpdate) {
             $lines.Add('  NOTE: Public MCP URL changed. Keep the same Notion Agent connection name; update only the connector URL manually.')
         }
@@ -1292,7 +1339,33 @@ function Monitor-ManagedInstance {
     $localProbe = Probe-LocalInstance -Instance $Instance
 
     if ($localProbe.Success) {
-        $publicProbeTimeoutSeconds = 5
+        # During warm-up after a tunnel restart, skip public probe failure counting
+        if ([int]$Instance.ProbeWarmupCyclesRemaining -gt 0) {
+            $Instance.ProbeWarmupCyclesRemaining = [int]$Instance.ProbeWarmupCyclesRemaining - 1
+            $Instance.LastPublicProbeStatus = 'warmup'
+            $Instance.LastPublicProbeMessage = "warm-up cycle remaining: $($Instance.ProbeWarmupCyclesRemaining)"
+            # Still do the public probe but don't count failures
+            $publicProbeTimeoutSeconds = 10
+            if ($null -ne $RuntimeConfig -and $null -ne $RuntimeConfig.PSObject.Properties['PublicProbeTimeoutSeconds']) {
+                $publicProbeTimeoutSeconds = [int]$RuntimeConfig.PublicProbeTimeoutSeconds
+            }
+            $publicProbe = Invoke-PublicMcpProbe -Instance $Instance -TimeoutSeconds $publicProbeTimeoutSeconds
+            if ($publicProbe.Success) {
+                # Tunnel is ready early — cancel remaining warm-up
+                $Instance.ProbeWarmupCyclesRemaining = 0
+                $Instance.ConsecutivePublicProbeFailures = 0
+                $Instance.ConsecutiveRepairFailures = 0
+                $Instance.LastPublicProbeStatus = 'ok'
+                $Instance.LastPublicProbeMessage = $publicProbe.Message
+                if ([string]::IsNullOrWhiteSpace($Instance.LastFailureReason)) {
+                    $Instance.LastFailureReason = ''
+                }
+            }
+            # If public probe fails during warm-up, we just note it without counting
+            return Get-InstanceStatus -Instance $Instance
+        }
+
+        $publicProbeTimeoutSeconds = 10
         if ($null -ne $RuntimeConfig -and $null -ne $RuntimeConfig.PSObject.Properties['PublicProbeTimeoutSeconds']) {
             $publicProbeTimeoutSeconds = [int]$RuntimeConfig.PublicProbeTimeoutSeconds
         }
@@ -1310,14 +1383,28 @@ function Monitor-ManagedInstance {
             $Instance.ConsecutivePublicProbeFailures = [int]$Instance.ConsecutivePublicProbeFailures + 1
             $Instance.LastPublicProbeStatus = 'failed'
             $Instance.LastPublicProbeMessage = $publicProbe.Message
-            $Instance.LastFailureReason = "Public MCP probe failed ($($Instance.ConsecutivePublicProbeFailures)/3): $($publicProbe.Message)"
-            if ($Instance.ConsecutivePublicProbeFailures -ge 3) {
-                [void](Repair-Instance `
-                    -Instance $Instance `
-                    -RuntimeConfig $RuntimeConfig `
-                    -RestartServer $false `
-                    -RestartTunnel $true `
-                    -Reason "Public MCP probe failed 3 times: $($publicProbe.Message)")
+            $Instance.LastFailureReason = "Public MCP probe failed ($($Instance.ConsecutivePublicProbeFailures)/5): $($publicProbe.Message)"
+            if ($Instance.ConsecutivePublicProbeFailures -ge 5) {
+                # Sanity check: verify local HEAD /mcp before deciding to restart tunnel only
+                $localHeadProbe = Invoke-LocalMcpProbe -Instance $Instance
+                if ($localHeadProbe.Success) {
+                    # Local is healthy — tunnel-only restart
+                    [void](Repair-Instance `
+                        -Instance $Instance `
+                        -RuntimeConfig $RuntimeConfig `
+                        -RestartServer $false `
+                        -RestartTunnel $true `
+                        -Reason "Public MCP probe failed 5 times (local HEAD OK): $($publicProbe.Message)")
+                }
+                else {
+                    # Local HEAD also failing — full restart
+                    [void](Repair-Instance `
+                        -Instance $Instance `
+                        -RuntimeConfig $RuntimeConfig `
+                        -RestartServer $true `
+                        -RestartTunnel $true `
+                        -Reason "Public MCP probe failed 5 times + local HEAD also failed: local=$($localHeadProbe.Message) public=$($publicProbe.Message)")
+                }
             }
         }
     }
@@ -1361,7 +1448,7 @@ $codexCommand = Get-MergedConfigValue -EnvMap $envMap -Name 'NOTION_LOCAL_OPS_CO
 $claudeCommand = Get-MergedConfigValue -EnvMap $envMap -Name 'NOTION_LOCAL_OPS_CLAUDE_COMMAND' -Default 'claude'
 $commandTimeout = Get-MergedIntConfigValue -EnvMap $envMap -Name 'NOTION_LOCAL_OPS_COMMAND_TIMEOUT' -Default 120
 $delegateTimeout = Get-MergedIntConfigValue -EnvMap $envMap -Name 'NOTION_LOCAL_OPS_DELEGATE_TIMEOUT' -Default 1800
-$publicProbeTimeoutSeconds = Get-MergedIntConfigValue -EnvMap $envMap -Name 'NOTION_LOCAL_OPS_TEST_PUBLIC_PROBE_TIMEOUT_SECONDS' -Default 5
+$publicProbeTimeoutSeconds = Get-MergedIntConfigValue -EnvMap $envMap -Name 'NOTION_LOCAL_OPS_TEST_PUBLIC_PROBE_TIMEOUT_SECONDS' -Default 10
 
 if ($MonitorIntervalSeconds -le 0) {
     throw "MonitorIntervalSeconds must be greater than 0."
