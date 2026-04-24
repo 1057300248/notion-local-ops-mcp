@@ -521,6 +521,9 @@ function Convert-StateInstance {
         LastPublicProbeMessage = [string](Get-OptionalPropertyValue -Object $Item -Name 'last_public_probe_message' -Default '')
         LastRepairAction = [string](Get-OptionalPropertyValue -Object $Item -Name 'last_repair_action' -Default '')
         ProbeWarmupCyclesRemaining = [int](Get-OptionalPropertyValue -Object $Item -Name 'probe_warmup_cycles_remaining' -Default 0)
+        ConsecutiveTunnelStartFailures = [int](Get-OptionalPropertyValue -Object $Item -Name 'consecutive_tunnel_start_failures' -Default 0)
+        LastTunnelStartAttemptAt = [string](Get-OptionalPropertyValue -Object $Item -Name 'last_tunnel_start_attempt_at' -Default '')
+        NextTunnelStartAttemptAt = [string](Get-OptionalPropertyValue -Object $Item -Name 'next_tunnel_start_attempt_at' -Default '')
     }
 }
 
@@ -595,6 +598,9 @@ function Write-LauncherState {
                     last_public_probe_message = $_.LastPublicProbeMessage
                     last_repair_action = $_.LastRepairAction
                     probe_warmup_cycles_remaining = $_.ProbeWarmupCyclesRemaining
+                    consecutive_tunnel_start_failures = $_.ConsecutiveTunnelStartFailures
+                    last_tunnel_start_attempt_at = $_.LastTunnelStartAttemptAt
+                    next_tunnel_start_attempt_at = $_.NextTunnelStartAttemptAt
                 }
             }
         )
@@ -684,49 +690,82 @@ function Test-LauncherStateMatchesRequest {
     return $true
 }
 
-function Wait-ForQuickTunnelUrl {
-    param(
-        [string[]]$LogPaths,
-        [int]$TimeoutSeconds = 45,
-        [int]$ProcessId = 0
-    )
+function Get-QuickTunnelFailureInfo {
+    param([string]$Text)
 
+    $message = 'quick tunnel URL not found'
+    $isRateLimited = $false
+    $isTransient = $false
+    $isFatal = $false
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return [pscustomobject]@{ Message = $message; IsRateLimited = $false; IsTransient = $false; IsFatal = $false }
+    }
+
+    if ($Text -match '429 Too Many Requests' -or $Text -match 'error code:\s*1015') {
+        $message = 'Cloudflare quick tunnel rate limited (429/1015). Wait before retrying.'
+        $isRateLimited = $true
+        $isTransient = $true
+    }
+    elseif ($Text -match 'failed to request quick Tunnel') { $message = 'cloudflared failed to request quick tunnel'; $isTransient = $true }
+    elseif ($Text -match '\bEOF\b') { $message = 'cloudflared quick tunnel request ended with EOF'; $isTransient = $true }
+    elseif ($Text -match 'underlying connection was closed' -or $Text -match 'An error occurred on a send' -or $Text -match 'SSL/TLS' -or $Text -match 'secure channel' -or $Text -match 'connection.*closed') { $message = 'transient TLS/socket error while probing quick tunnel'; $isTransient = $true }
+    elseif ($Text -match 'failed to unmarshal quick Tunnel') { $message = 'cloudflared received an invalid quick tunnel response'; $isTransient = $true }
+    elseif ($Text -match 'cloudflared') { $message = 'cloudflared exited before a quick tunnel URL was emitted'; $isTransient = $true }
+
+    return [pscustomobject]@{ Message = $message; IsRateLimited = $isRateLimited; IsTransient = $isTransient; IsFatal = $isFatal }
+}
+
+function Get-QuickTunnelStartBackoffSeconds {
+    param([int]$FailureCount, [bool]$RateLimited, [bool]$Transient)
+    $n = [Math]::Max($FailureCount, 1)
+    if ($RateLimited) {
+        switch ([Math]::Min($n, 5)) { 1 { return 300 } 2 { return 600 } 3 { return 900 } 4 { return 1800 } default { return 3600 } }
+    }
+    if ($Transient) {
+        switch ([Math]::Min($n, 5)) { 1 { return 60 } 2 { return 120 } 3 { return 300 } 4 { return 600 } default { return 900 } }
+    }
+    switch ([Math]::Min($n, 4)) { 1 { return 30 } 2 { return 60 } 3 { return 120 } default { return 300 } }
+}
+
+function Get-CombinedLogText {
+    param([string[]]$LogPaths)
+    $combined = ''
+    foreach ($logPath in @($LogPaths)) {
+        if (-not [string]::IsNullOrWhiteSpace($logPath) -and (Test-Path -LiteralPath $logPath)) {
+            try { $combined += "`n" + (Get-Content -LiteralPath $logPath -Raw -Encoding UTF8 -ErrorAction Stop) } catch { }
+        }
+    }
+    return $combined
+}
+
+function Wait-ForQuickTunnelUrl {
+    param([string[]]$LogPaths, [int]$TimeoutSeconds = 45, [int]$ProcessId = 0)
+    $script:LastQuickTunnelFailureInfo = $null
     $quickTunnelPattern = 'https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com'
     $localTestPattern = 'https?://(?:127\.0\.0\.1|localhost):\d+'
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $combined = ''
     while ((Get-Date) -lt $deadline) {
-        $combined = ''
-        foreach ($logPath in @($LogPaths)) {
-            if (-not [string]::IsNullOrWhiteSpace($logPath) -and (Test-Path -LiteralPath $logPath)) {
-                try {
-                    $combined += "`n" + (Get-Content -LiteralPath $logPath -Raw -Encoding UTF8 -ErrorAction Stop)
-                }
-                catch {
-                }
-            }
-        }
-
+        $combined = Get-CombinedLogText -LogPaths $LogPaths
         if (-not [string]::IsNullOrWhiteSpace($combined)) {
             $quickMatches = [regex]::Matches($combined, $quickTunnelPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-            if ($quickMatches.Count -gt 0) {
-                return $quickMatches[$quickMatches.Count - 1].Value
-            }
-
+            if ($quickMatches.Count -gt 0) { return $quickMatches[$quickMatches.Count - 1].Value }
             $localMatches = [regex]::Matches($combined, $localTestPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-            if ($localMatches.Count -gt 0) {
-                return $localMatches[$localMatches.Count - 1].Value
-            }
-        }
-
-        if ($ProcessId -gt 0 -and -not (Test-ProcessAlive -ProcessId $ProcessId)) {
-            if ($combined -match 'failed to request quick Tunnel') {
+            if ($localMatches.Count -gt 0) { return $localMatches[$localMatches.Count - 1].Value }
+            $failureInfo = Get-QuickTunnelFailureInfo -Text $combined
+            if ($failureInfo.IsRateLimited -or ($failureInfo.IsTransient -and $combined -match 'failed to request quick Tunnel|failed to unmarshal quick Tunnel|\bEOF\b')) {
+                $script:LastQuickTunnelFailureInfo = $failureInfo
                 break
             }
         }
-
+        if ($ProcessId -gt 0 -and -not (Test-ProcessAlive -ProcessId $ProcessId)) {
+            $script:LastQuickTunnelFailureInfo = Get-QuickTunnelFailureInfo -Text $combined
+            break
+        }
         Start-Sleep -Milliseconds 500
     }
-
+    if ($null -eq $script:LastQuickTunnelFailureInfo) { $script:LastQuickTunnelFailureInfo = Get-QuickTunnelFailureInfo -Text $combined }
     return $null
 }
 
@@ -804,6 +843,9 @@ function New-ManagedInstanceRecord {
         LastPublicProbeMessage = ''
         LastRepairAction = ''
         ProbeWarmupCyclesRemaining = 0
+        ConsecutiveTunnelStartFailures = 0
+        LastTunnelStartAttemptAt = ''
+        NextTunnelStartAttemptAt = ''
     }
 
     Initialize-InstanceLayout -Instance $instance
@@ -856,15 +898,18 @@ function Start-QuickTunnel {
     )
 
     Stop-ManagedProcess -ProcessId ([int]$Instance.CloudflaredProcessId)
+    $Instance.CloudflaredProcessId = 0
     foreach ($path in @($Instance.CloudflaredStdoutLogPath, $Instance.CloudflaredStderrLogPath)) {
         Reset-LogFile -Path $path
     }
 
+    $Instance.LastTunnelStartAttemptAt = (Get-Date).ToString('o')
     $originUrl = "http://$($Instance.Host):$($Instance.Port)"
     $quickTunnelUrl = $null
     $launchAttempts = 3
     $process = $null
     $cloudflaredExecutable = $RuntimeConfig.CloudflaredExecutable
+    $lastFailureInfo = $null
     for ($attempt = 1; $attempt -le $launchAttempts; $attempt++) {
         $extension = [System.IO.Path]::GetExtension($cloudflaredExecutable).ToLowerInvariant()
         if ($extension -eq '.ps1') {
@@ -903,15 +948,31 @@ function Start-QuickTunnel {
             break
         }
 
-            Stop-ManagedProcess -ProcessId $process.Id
-            $process = $null
-            if ($attempt -lt $launchAttempts) {
-                Start-Sleep -Seconds 2
-            }
+        $lastFailureInfo = $script:LastQuickTunnelFailureInfo
+        Stop-ManagedProcess -ProcessId $process.Id
+        $process = $null
+        if ($attempt -lt $launchAttempts) {
+            $shortDelay = 2
+            if ($null -ne $lastFailureInfo -and $lastFailureInfo.IsRateLimited) { $shortDelay = 10 }
+            Start-Sleep -Seconds $shortDelay
+        }
     }
 
     if ([string]::IsNullOrWhiteSpace($quickTunnelUrl) -or $null -eq $process) {
-        throw "Failed to extract quick tunnel URL for $($Instance.Name) after $launchAttempts attempts. See $($Instance.CloudflaredStderrLogPath)"
+        if ($null -eq $lastFailureInfo) { $lastFailureInfo = $script:LastQuickTunnelFailureInfo }
+        if ($null -eq $lastFailureInfo) { $lastFailureInfo = Get-QuickTunnelFailureInfo -Text (Get-CombinedLogText -LogPaths @($Instance.CloudflaredStderrLogPath, $Instance.CloudflaredStdoutLogPath)) }
+        $Instance.ConsecutiveTunnelStartFailures = [int]$Instance.ConsecutiveTunnelStartFailures + 1
+        $backoffSeconds = Get-QuickTunnelStartBackoffSeconds `
+            -FailureCount ([int]$Instance.ConsecutiveTunnelStartFailures) `
+            -RateLimited ([bool]$lastFailureInfo.IsRateLimited) `
+            -Transient ([bool]$lastFailureInfo.IsTransient)
+        $Instance.NextTunnelStartAttemptAt = (Get-Date).AddSeconds($backoffSeconds).ToString('o')
+        $Instance.LastPublicProbeStatus = 'tunnel_start_failed'
+        $Instance.LastPublicProbeMessage = $lastFailureInfo.Message
+        $Instance.LastFailureReason = "Quick tunnel start failed after $launchAttempts attempts: $($lastFailureInfo.Message). Next retry after $($Instance.NextTunnelStartAttemptAt). See $($Instance.CloudflaredStderrLogPath)"
+        $Instance.PublicUrl = ''
+        $Instance.PublicMcpUrl = ''
+        return $false
     }
 
     $oldPublicMcpUrl = [string]$Instance.PublicMcpUrl
@@ -922,10 +983,14 @@ function Start-QuickTunnel {
     $Instance.ProbeWarmupCyclesRemaining = 3
     $Instance.LastPublicProbeStatus = 'pending'
     $Instance.LastPublicProbeMessage = 'waiting for public tunnel warm-up'
+    $Instance.ConsecutiveTunnelStartFailures = 0
+    $Instance.NextTunnelStartAttemptAt = ''
+    $Instance.LastFailureReason = ''
     if (-not [string]::IsNullOrWhiteSpace($oldPublicMcpUrl) -and $oldPublicMcpUrl -ne $Instance.PublicMcpUrl) {
         $Instance.NeedsNotionUrlUpdate = $true
         $Instance.UrlChangedAt = (Get-Date).ToString('o')
     }
+    return $true
 }
 
 function Invoke-PublicMcpProbe {
@@ -979,7 +1044,7 @@ function Invoke-PublicMcpProbe {
             # and should NOT count the same as a definitive HTTP error (404, 405).
             $isTransient = $false
             if ($statusCode -eq 0) {
-                $transientPatterns = @('The underlying connection was closed','An error occurred on a send','An error occurred on a receive','Unable to read data','Unable to write data','The connection was closed','SSL/TLS','secure channel','Could not create SSL/TLS','remote name could not be resolved','No such host','connection attempt failed','Operation timed out')
+                $transientPatterns = @('The underlying connection was closed','An error occurred on a send','An error occurred on a receive','Unable to read data','Unable to write data','The connection was closed','SSL/TLS','secure channel','Could not create SSL/TLS','remote name could not be resolved','No such host','connection attempt failed','Operation timed out','EOF')
                 foreach ($p in $transientPatterns) {
                     if ($message.Contains($p)) {
                         $isTransient = $true
@@ -1155,18 +1220,22 @@ function Repair-Instance {
             $Instance.ServerProcessId = 0
         }
 
+        $repairOk = $true
         if ($RestartServer) {
             Start-ManagedServer -Instance $Instance -RuntimeConfig $RuntimeConfig
-            Start-QuickTunnel -Instance $Instance -RuntimeConfig $RuntimeConfig
+            $repairOk = Start-QuickTunnel -Instance $Instance -RuntimeConfig $RuntimeConfig
         }
         elseif ($RestartTunnel) {
-            Start-QuickTunnel -Instance $Instance -RuntimeConfig $RuntimeConfig
+            $repairOk = Start-QuickTunnel -Instance $Instance -RuntimeConfig $RuntimeConfig
         }
 
-        $Instance.ConsecutivePublicProbeFailures = 0
-        $Instance.ConsecutiveRepairFailures = 0
-        $Instance.LastFailureReason = ''
-        return $true
+        if ($repairOk) {
+            $Instance.ConsecutivePublicProbeFailures = 0
+            $Instance.ConsecutiveRepairFailures = 0
+            $Instance.LastFailureReason = ''
+            return $true
+        }
+        return $false
     }
     catch {
         $Instance.LastFailureReason = "$Reason :: $($_.Exception.Message)"
@@ -1186,6 +1255,12 @@ function Get-InstanceStatus {
     }
     elseif ($serverAlive -and $listening -and $Instance.LastPublicProbeStatus -eq 'warmup') {
         'Warmup'
+    }
+    elseif ($serverAlive -and $listening -and $Instance.LastPublicProbeStatus -eq 'tunnel_start_failed') {
+        'TunnelStartFail'
+    }
+    elseif ($serverAlive -and $listening -and [string]::IsNullOrWhiteSpace($Instance.PublicMcpUrl)) {
+        'TunnelUrlMissing'
     }
     elseif ($serverAlive -and $listening -and $Instance.LastPublicProbeStatus -eq 'failed') {
         'PublicProbeFail'
@@ -1218,6 +1293,9 @@ function Get-InstanceStatus {
         LastFailureReason = $Instance.LastFailureReason
         NeedsNotionUrlUpdate = $Instance.NeedsNotionUrlUpdate
         ProbeWarmupCyclesRemaining = $Instance.ProbeWarmupCyclesRemaining
+        NextTunnelStartAttemptAt = $Instance.NextTunnelStartAttemptAt
+        LastPublicProbeStatus = $Instance.LastPublicProbeStatus
+        LastPublicProbeMessage = $Instance.LastPublicProbeMessage
         ServerLog = $Instance.ServerLogPath
         CloudflaredStdoutLog = $Instance.CloudflaredStdoutLogPath
         CloudflaredStderrLog = $Instance.CloudflaredStderrLogPath
@@ -1275,6 +1353,9 @@ function Write-StatusSnapshot {
         $lines.Add(("  cloudflared PID: {0}" -f $row.TunnelPID))
         if ($row.Status -eq 'Warmup') {
             $lines.Add(("  Warm-up cycles remaining: {0}" -f $row.ProbeWarmupCyclesRemaining))
+        }
+        if ($row.Status -eq 'TunnelStartFail' -and -not [string]::IsNullOrWhiteSpace($row.NextTunnelStartAttemptAt)) {
+            $lines.Add(("  Next tunnel retry: {0}" -f $row.NextTunnelStartAttemptAt))
         }
         if ($row.NeedsNotionUrlUpdate) {
             $lines.Add('  NOTE: Public MCP URL changed. Keep the same Notion Agent connection name; update only the connector URL manually.')
@@ -1387,6 +1468,9 @@ function Render-StatusPanel {
         Write-Host ("    Public URL: {0}" -f $row.PublicUrl)
         Write-Host ("    Public MCP URL: {0}" -f $row.PublicMcpUrl)
         Write-Host ("    Restart Count: {0}" -f $row.RestartCount)
+        if ($row.Status -eq 'TunnelStartFail' -and -not [string]::IsNullOrWhiteSpace($row.NextTunnelStartAttemptAt)) {
+            Write-Host ("    Next tunnel retry: {0}" -f $row.NextTunnelStartAttemptAt) -ForegroundColor Yellow
+        }
         if ($row.NeedsNotionUrlUpdate) {
             Write-Host '    NOTE: Public MCP URL changed. Keep the same Notion Agent connection name; update only the connector URL manually.' -ForegroundColor Yellow
         }
@@ -1411,6 +1495,20 @@ function Monitor-ManagedInstance {
     $localProbe = Probe-LocalInstance -Instance $Instance
 
     if ($localProbe.Success) {
+        if ([string]::IsNullOrWhiteSpace($Instance.PublicMcpUrl) -or $Instance.LastPublicProbeStatus -eq 'tunnel_start_failed' -or -not (Test-ProcessAlive -ProcessId ([int]$Instance.CloudflaredProcessId))) {
+            $retryDue = $true
+            if (-not [string]::IsNullOrWhiteSpace($Instance.NextTunnelStartAttemptAt)) {
+                try { $retryDue = ((Get-Date) -ge ([datetime]::Parse($Instance.NextTunnelStartAttemptAt))) }
+                catch { $retryDue = $true }
+            }
+            if ($retryDue) { [void](Start-QuickTunnel -Instance $Instance -RuntimeConfig $RuntimeConfig) }
+            else {
+                $Instance.LastPublicProbeStatus = 'tunnel_start_failed'
+                $Instance.LastPublicProbeMessage = "waiting for quick tunnel retry at $($Instance.NextTunnelStartAttemptAt)"
+            }
+            return Get-InstanceStatus -Instance $Instance
+        }
+
         # During warm-up after a tunnel restart, skip public probe failure counting
         if ([int]$Instance.ProbeWarmupCyclesRemaining -gt 0) {
             $Instance.ProbeWarmupCyclesRemaining = [int]$Instance.ProbeWarmupCyclesRemaining - 1
@@ -1462,13 +1560,8 @@ function Monitor-ManagedInstance {
                 # Sanity check: verify local HEAD /mcp before deciding to restart tunnel only
                 $localHeadProbe = Invoke-LocalMcpProbe -Instance $Instance
                 if ($localHeadProbe.Success) {
-                    # Local is healthy — tunnel-only restart
-                    [void](Repair-Instance `
-                        -Instance $Instance `
-                        -RuntimeConfig $RuntimeConfig `
-                        -RestartServer $false `
-                        -RestartTunnel $true `
-                        -Reason "Public MCP probe failed $threshold times (local HEAD OK): $($publicProbe.Message)")
+                    # Local is healthy; keep the server and current tunnel process stable.
+                    $Instance.LastFailureReason = "Public MCP probe failed $threshold times (local HEAD OK; tunnel kept running): $($publicProbe.Message)"
                 }
                 else {
                     # Local HEAD also failing — full restart
@@ -1626,7 +1719,8 @@ if ($instances.Count -eq 0) {
                 -LauncherInstancesDir $launcherInstancesDir
 
             Start-ManagedServer -Instance $instance -RuntimeConfig $runtimeConfig
-            Start-QuickTunnel -Instance $instance -RuntimeConfig $runtimeConfig
+            if ($i -gt 0) { Start-Sleep -Seconds 5 }
+            [void](Start-QuickTunnel -Instance $instance -RuntimeConfig $runtimeConfig)
             [void]$startedInstances.Add($instance)
         }
 
