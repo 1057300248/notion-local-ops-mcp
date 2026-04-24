@@ -977,21 +977,21 @@ function Invoke-PublicMcpProbe {
 
             # Classify: connection-level errors (TLS, DNS, socket) are transient
             # and should NOT count the same as a definitive HTTP error (404, 405).
-            $isTransient = $statusCode -eq 0 -and (
-                $message.Contains('基础连接已经关闭') -or
-                $message.Contains('发送时发生错误') -or
-                $message.Contains('接收时发生错误') -or
-                $message.Contains('Unable to read data') -or
-                $message.Contains('Unable to write data') -or
-                $message.Contains('The connection was closed') -or
-                $message.Contains('SSL/TLS') -or
-                $message.Contains('secure channel') -or
-                $message.Contains('Could not create SSL/TLS') -or
-                $message.Contains('remote name could not be resolved') -or
-                $message.Contains('No such host') -or
-                $message.Contains('connection attempt failed') -or
-                $message.Contains('Operation timed out')
-            )
+            $isTransient = $statusCode -eq 0 -and @(
+                '基础连接已经关闭',
+                '发送时发生错误',
+                '接收时发生错误',
+                'Unable to read data',
+                'Unable to write data',
+                'The connection was closed',
+                'SSL/TLS',
+                'secure channel',
+                'Could not create SSL/TLS',
+                'remote name could not be resolved',
+                'No such host',
+                'connection attempt failed',
+                'Operation timed out'
+            ) | Where-Object { $message.Contains($_) } | Measure-Object | Select-Object -ExpandProperty Count
 
             if ($isTransient) {
                 # Transient connection error — don't retry with GET, it'll likely
