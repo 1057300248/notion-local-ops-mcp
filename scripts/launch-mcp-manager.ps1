@@ -11,10 +11,17 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 Add-Type -AssemblyName System.Net.Http
+try {
+    [Console]::InputEncoding = [System.Text.Encoding]::UTF8
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+}
+catch {
+}
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $envMap = @{}
 $DesktopStatusPath = Join-Path ([Environment]::GetFolderPath('Desktop')) "Notion-MCP-status.txt"
+$script:PanelInputWarning = ''
 
 function Read-DotEnvFile {
     param([string]$Path)
@@ -232,7 +239,7 @@ function Reset-LogFile {
         }
     }
 
-    throw "Unable to reset log file ${Path}: $lastError"
+    Write-Host "[WARN] Unable to reset log file ${Path}; continuing with append-only log. Last error: $lastError" -ForegroundColor Yellow
 }
 
 function Get-FreePorts {
@@ -711,6 +718,7 @@ function Get-QuickTunnelFailureInfo {
     elseif ($Text -match '\bEOF\b') { $message = 'cloudflared quick tunnel request ended with EOF'; $isTransient = $true }
     elseif ($Text -match 'underlying connection was closed' -or $Text -match 'An error occurred on a send' -or $Text -match 'SSL/TLS' -or $Text -match 'secure channel' -or $Text -match 'connection.*closed') { $message = 'transient TLS/socket error while probing quick tunnel'; $isTransient = $true }
     elseif ($Text -match 'failed to unmarshal quick Tunnel') { $message = 'cloudflared received an invalid quick tunnel response'; $isTransient = $true }
+    elseif (Test-QuickTunnelEdgeFailure -Text $Text) { $message = 'cloudflared failed to connect to Cloudflare edge'; $isTransient = $true }
     elseif ($Text -match 'cloudflared') { $message = 'cloudflared exited before a quick tunnel URL was emitted'; $isTransient = $true }
 
     return [pscustomobject]@{ Message = $message; IsRateLimited = $isRateLimited; IsTransient = $isTransient; IsFatal = $isFatal }
@@ -739,20 +747,55 @@ function Get-CombinedLogText {
     return $combined
 }
 
+function Test-QuickTunnelEdgeReady {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $false
+    }
+
+    return ($Text -match 'Registered tunnel connection' -or
+        $Text -match 'Connection.*registered' -or
+        $Text -match 'Tunnel connection.*registered')
+}
+
+function Test-QuickTunnelEdgeFailure {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return $false
+    }
+
+    return ($Text -match 'Failed to dial a quic connection' -or
+        $Text -match 'failed to dial to edge' -or
+        $Text -match 'timeout: no recent network activity' -or
+        $Text -match 'Unable to establish.*connection' -or
+        $Text -match 'connection.*edge.*failed')
+}
+
 function Wait-ForQuickTunnelUrl {
     param([string[]]$LogPaths, [int]$TimeoutSeconds = 45, [int]$ProcessId = 0)
     $script:LastQuickTunnelFailureInfo = $null
     $quickTunnelPattern = 'https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com'
-    $localTestPattern = 'https?://(?:127\.0\.0\.1|localhost):\d+'
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $combined = ''
     while ((Get-Date) -lt $deadline) {
         $combined = Get-CombinedLogText -LogPaths $LogPaths
         if (-not [string]::IsNullOrWhiteSpace($combined)) {
             $quickMatches = [regex]::Matches($combined, $quickTunnelPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-            if ($quickMatches.Count -gt 0) { return $quickMatches[$quickMatches.Count - 1].Value }
-            $localMatches = [regex]::Matches($combined, $localTestPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-            if ($localMatches.Count -gt 0) { return $localMatches[$localMatches.Count - 1].Value }
+            if ($quickMatches.Count -gt 0) {
+                $quickUrl = $quickMatches[$quickMatches.Count - 1].Value
+                if (Test-QuickTunnelEdgeReady -Text $combined) { return $quickUrl }
+                if (Test-QuickTunnelEdgeFailure -Text $combined) {
+                    $script:LastQuickTunnelFailureInfo = [pscustomobject]@{
+                        Message = 'cloudflared got a quick tunnel URL but failed to connect to Cloudflare edge'
+                        IsRateLimited = $false
+                        IsTransient = $true
+                        IsFatal = $false
+                    }
+                    break
+                }
+            }
             $failureInfo = Get-QuickTunnelFailureInfo -Text $combined
             if ($failureInfo.IsRateLimited -or ($failureInfo.IsTransient -and $combined -match 'failed to request quick Tunnel|failed to unmarshal quick Tunnel|\bEOF\b')) {
                 $script:LastQuickTunnelFailureInfo = $failureInfo
@@ -909,13 +952,21 @@ function Start-QuickTunnel {
     $launchAttempts = 3
     $process = $null
     $cloudflaredExecutable = $RuntimeConfig.CloudflaredExecutable
+    $cloudflaredProtocol = ''
+    if ($null -ne $RuntimeConfig -and $null -ne $RuntimeConfig.PSObject.Properties['CloudflaredProtocol']) {
+        $cloudflaredProtocol = [string]$RuntimeConfig.CloudflaredProtocol
+    }
+    $tunnelArgs = @('tunnel', '--url', $originUrl)
+    if (-not [string]::IsNullOrWhiteSpace($cloudflaredProtocol)) {
+        $tunnelArgs += @('--protocol', $cloudflaredProtocol)
+    }
     $lastFailureInfo = $null
     for ($attempt = 1; $attempt -le $launchAttempts; $attempt++) {
         $extension = [System.IO.Path]::GetExtension($cloudflaredExecutable).ToLowerInvariant()
         if ($extension -eq '.ps1') {
             $process = Start-Process `
                 -FilePath 'powershell.exe' `
-                -ArgumentList @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $cloudflaredExecutable, 'tunnel', '--url', $originUrl) `
+                -ArgumentList (@('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $cloudflaredExecutable) + $tunnelArgs) `
                 -WorkingDirectory $RepoRoot `
                 -RedirectStandardOutput $Instance.CloudflaredStdoutLogPath `
                 -RedirectStandardError $Instance.CloudflaredStderrLogPath `
@@ -925,7 +976,7 @@ function Start-QuickTunnel {
         elseif ($extension -eq '.py') {
             $process = Start-Process `
                 -FilePath $RuntimeConfig.PythonPath `
-                -ArgumentList @($cloudflaredExecutable, 'tunnel', '--url', $originUrl) `
+                -ArgumentList (@($cloudflaredExecutable) + $tunnelArgs) `
                 -WorkingDirectory $RepoRoot `
                 -RedirectStandardOutput $Instance.CloudflaredStdoutLogPath `
                 -RedirectStandardError $Instance.CloudflaredStderrLogPath `
@@ -935,7 +986,7 @@ function Start-QuickTunnel {
         else {
             $process = Start-Process `
                 -FilePath $cloudflaredExecutable `
-                -ArgumentList @('tunnel', '--url', $originUrl) `
+                -ArgumentList $tunnelArgs `
                 -WorkingDirectory $RepoRoot `
                 -RedirectStandardOutput $Instance.CloudflaredStdoutLogPath `
                 -RedirectStandardError $Instance.CloudflaredStderrLogPath `
@@ -1373,9 +1424,60 @@ function Write-StatusSnapshot {
     Set-Content -LiteralPath $StatusPath -Value $lines -Encoding UTF8
 }
 
+function Convert-KeyToPanelCommand {
+    param(
+        [string]$KeyName,
+        [string]$Character
+    )
+
+    $keyText = ''
+    if (-not [string]::IsNullOrWhiteSpace($Character)) {
+        $keyText = $Character.ToUpperInvariant()
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($KeyName)) {
+        $keyText = $KeyName.ToUpperInvariant()
+    }
+
+    switch ($keyText) {
+        '13' { return 'refresh' }
+        '76' { return 'logs' }
+        '81' { return 'quit' }
+        '82' { return 'refresh' }
+        '83' { return 'stop' }
+        'ENTER' { return 'refresh' }
+        "`r" { return 'refresh' }
+        "`n" { return 'refresh' }
+        'R' { return 'refresh' }
+        'L' { return 'logs' }
+        'S' { return 'stop' }
+        'Q' { return 'quit' }
+        default {
+            if (-not [string]::IsNullOrWhiteSpace($Character)) {
+                return "unknown:$Character"
+            }
+            if (-not [string]::IsNullOrWhiteSpace($KeyName)) {
+                return "unknown:$KeyName"
+            }
+            return ''
+        }
+    }
+}
+
 function Try-ReadPanelCommand {
     if ($NonInteractive) {
         return ''
+    }
+
+    # PowerShell console hosts launched from .cmd are more reliable through RawUI
+    # than through [Console]::KeyAvailable. Keep Console as a fallback.
+    try {
+        if ($null -ne $Host -and $null -ne $Host.UI -and $null -ne $Host.UI.RawUI -and $Host.UI.RawUI.KeyAvailable) {
+            $key = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+            return Convert-KeyToPanelCommand -KeyName ([string]$key.VirtualKeyCode) -Character ([string]$key.Character)
+        }
+    }
+    catch {
+        $script:PanelInputWarning = "RawUI input unavailable: $($_.Exception.Message)"
     }
 
     try {
@@ -1384,16 +1486,10 @@ function Try-ReadPanelCommand {
         }
 
         $key = [Console]::ReadKey($true)
-        switch ($key.Key) {
-            'Enter' { return 'refresh' }
-            'R' { return 'refresh' }
-            'L' { return 'logs' }
-            'S' { return 'stop' }
-            'Q' { return 'quit' }
-            default { return "unknown:$($key.KeyChar)" }
-        }
+        return Convert-KeyToPanelCommand -KeyName ([string]$key.Key) -Character ([string]$key.KeyChar)
     }
     catch {
+        $script:PanelInputWarning = "Console input unavailable: $($_.Exception.Message)"
         return ''
     }
 }
@@ -1482,6 +1578,9 @@ function Render-StatusPanel {
         Write-Host ("    Tunnel stderr log: {0}" -f $row.CloudflaredStderrLog)
     }
     Write-Host ''
+    if (-not [string]::IsNullOrWhiteSpace($script:PanelInputWarning)) {
+        Write-Host ("Input warning: {0}" -f $script:PanelInputWarning) -ForegroundColor DarkYellow
+    }
     Write-Host 'Keys: [Enter]/R=refresh  L=open logs  S=shutdown all  Q=close panel only' -ForegroundColor Yellow
 }
 
@@ -1611,6 +1710,7 @@ $baseStateDir = Normalize-ExistingPath -Path $baseStateDir
 $authToken = Get-MergedConfigValue -EnvMap $envMap -Name 'NOTION_LOCAL_OPS_AUTH_TOKEN' -Default ''
 $secondAuthToken = Get-MergedConfigValue -EnvMap $envMap -Name 'NOTION_LOCAL_OPS_AUTH_TOKEN_SECOND' -Default $authToken
 $cloudflaredCommand = Get-MergedConfigValue -EnvMap $envMap -Name 'NOTION_LOCAL_OPS_CLOUDFLARED_COMMAND' -Default ''
+$cloudflaredProtocol = Get-MergedConfigValue -EnvMap $envMap -Name 'NOTION_LOCAL_OPS_CLOUDFLARED_PROTOCOL' -Default 'http2'
 $codexCommand = Get-MergedConfigValue -EnvMap $envMap -Name 'NOTION_LOCAL_OPS_CODEX_COMMAND' -Default 'codex'
 $claudeCommand = Get-MergedConfigValue -EnvMap $envMap -Name 'NOTION_LOCAL_OPS_CLAUDE_COMMAND' -Default 'claude'
 $commandTimeout = Get-MergedIntConfigValue -EnvMap $envMap -Name 'NOTION_LOCAL_OPS_COMMAND_TIMEOUT' -Default 120
@@ -1629,6 +1729,7 @@ $runtimeConfig = [pscustomobject]@{
     ServerExecutable = $serverExecutable
     PythonPath = $runtimeValidation.PythonPath
     CloudflaredExecutable = $cloudflaredExecutable
+    CloudflaredProtocol = $cloudflaredProtocol
     WorkspaceRoot = $workspaceRoot
     CodexCommand = $codexCommand
     ClaudeCommand = $claudeCommand
@@ -1650,6 +1751,9 @@ else {
     Write-Host "fastmcp: $($runtimeValidation.FastMcpVersion) (supported: $($runtimeValidation.SupportedSpec))"
     Write-Host "uvicorn: $($runtimeValidation.UvicornVersion)"
     Write-Host "Cloudflared: $cloudflaredExecutable"
+if (-not [string]::IsNullOrWhiteSpace($cloudflaredProtocol)) {
+    Write-Host "Cloudflared protocol: $cloudflaredProtocol"
+}
     Write-Host ''
 
     if ($RequestedCount -gt 0) {
