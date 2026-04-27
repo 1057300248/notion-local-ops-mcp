@@ -36,6 +36,52 @@ Use this in your MCP Agent configuration inside Notion:
 - Auth type: `Bearer`
 - Token: `NOTION_LOCAL_OPS_AUTH_TOKEN`
 
+## ChatGPT Web OAuth
+
+ChatGPT web developer mode expects an HTTPS MCP endpoint and can connect with
+OAuth. This project implements a minimal OAuth compatibility mode for local
+use: dynamic client registration, PKCE authorization code flow, protected
+resource metadata, and bearer access tokens. It does not implement a full user
+account system or ChatGPT iframe UI widgets.
+
+Enable OAuth mode in `.env`:
+
+```bash
+NOTION_LOCAL_OPS_AUTH_MODE=oauth
+NOTION_LOCAL_OPS_PUBLIC_BASE_URL="https://<your-domain-or-tunnel>"
+NOTION_LOCAL_OPS_AUTH_TOKEN="replace-me"
+# Optional: use a separate login token for the OAuth authorization page.
+# NOTION_LOCAL_OPS_OAUTH_LOGIN_TOKEN="replace-me"
+```
+
+Then restart the service. For launchd-managed installs, reinstall or restart so
+the generated plist receives the new env values:
+
+```bash
+./scripts/install-launchd.sh
+```
+
+Create the ChatGPT app/connector with:
+
+- MCP server URL: `https://<your-domain-or-tunnel>/mcp`
+- Authentication: `OAuth`
+- Client registration: dynamic registration, if ChatGPT offers the choice
+
+When ChatGPT opens the authorization page, enter `NOTION_LOCAL_OPS_AUTH_TOKEN`
+unless `NOTION_LOCAL_OPS_OAUTH_LOGIN_TOKEN` is set.
+
+Smoke-test the public OAuth surface before adding it to ChatGPT:
+
+```bash
+curl -sS https://<your-domain-or-tunnel>/.well-known/oauth-protected-resource/mcp
+curl -sS https://<your-domain-or-tunnel>/.well-known/oauth-authorization-server
+curl -i https://<your-domain-or-tunnel>/mcp
+```
+
+The first two commands should return JSON metadata. The `/mcp` request without
+credentials should return `401` with a `WWW-Authenticate` header containing
+`resource_metadata`.
+
 Use the prompt below for the **MCP Agent**. It is not for the Notion AI instruction page.
 
 <details>
@@ -69,7 +115,7 @@ Tool strategy:
 - server_info: call first when troubleshooting connection/runtime mismatches.
 - set_default_cwd / get_default_cwd: set once for repeated repo operations instead of passing cwd every time.
 - In coding tasks, search the local repo first. Do not default to searching the Notion workspace.
-- apply_patch: use this as the default edit tool for existing files, including small edits, multi-hunk edits, moves, deletes, or adds in one patch. Use dry_run=true, validate_only=true, or return_diff=true when you want validation or a preview before writing.
+- apply_patch: use this as the default edit tool for existing files, including small edits, multi-hunk edits, moves, deletes, or adds in one patch. Each @@ hunk must include at least one '+' or '-' line and must match exactly one location in the file. Use dry_run=true, validate_only=true, or return_diff=true when you want validation or a preview before writing.
 - write_file: create new files or rewrite short files when that is simpler than patching; use dry_run=true for no-write preview.
 - run_command_stream: start long-running shell jobs with immediate task_id return for polling progress. Prefer it for tests, installs, builds, compile steps, and other jobs that may take a while.
 - get_task / wait_task: check delegated task or background command status; prefer wait_task when blocking is useful.
@@ -153,7 +199,8 @@ What you should expect:
 
 - the script creates or reuses `.venv`
 - the script installs missing Python dependencies automatically
-- the script starts the local MCP server on `http://127.0.0.1:8766/mcp`
+- the script starts the local MCP server on `http://127.0.0.1:8766/mcp` through a rolling-reload supervisor
+- the script prints a `./scripts/dev-tunnel.sh reload` command so you can restart the local server without dropping the tunnel
 - the script prefers `cloudflared.local.yml` for a named tunnel
 - otherwise it falls back to a `cloudflared` quick tunnel and prints a public HTTPS URL
 
@@ -187,6 +234,8 @@ NOTION_LOCAL_OPS_CODEX_COMMAND="codex"
 NOTION_LOCAL_OPS_CLAUDE_COMMAND="claude"
 NOTION_LOCAL_OPS_COMMAND_TIMEOUT="120"
 NOTION_LOCAL_OPS_DELEGATE_TIMEOUT="1800"
+NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS="30"
+NOTION_LOCAL_OPS_LAUNCHD_LABEL_PREFIX="com.notion-local-ops"
 ```
 
 ### Manual Start
@@ -215,7 +264,8 @@ What it does:
 - reuses or creates `.venv`
 - installs missing runtime dependencies
 - loads `.env` from the repo root if present
-- starts `notion-local-ops-mcp`
+- starts `notion-local-ops-mcp` behind a rolling-reload supervisor
+- keeps the public tunnel stable while `./scripts/dev-tunnel.sh reload` swaps in a fresh server process
 - prefers `cloudflared.local.yml` or `cloudflared.local.yaml` if present
 - otherwise opens a `cloudflared` quick tunnel to your local server
 
@@ -225,7 +275,48 @@ Notes:
 - `cloudflared.local.yml` is gitignored, so your local named tunnel config stays out of git
 - if `NOTION_LOCAL_OPS_WORKSPACE_ROOT` is unset, the script defaults it to the repo root
 - if `NOTION_LOCAL_OPS_AUTH_TOKEN` is unset, the script exits with an error instead of guessing
+- `./scripts/dev-tunnel.sh reload` sends `SIGHUP` to the supervisor and rolls the server process without dropping the public `/mcp` endpoint
 - for a fresh clone, you do not need to run `pip install` manually before using this script
+
+### Rolling Reload Without Dropping The Tunnel
+
+Once `./scripts/dev-tunnel.sh` is already running in one terminal or tmux pane, use this from another shell:
+
+```bash
+./scripts/dev-tunnel.sh reload
+```
+
+This keeps `cloudflared` attached to the same local port while the supervisor starts a fresh MCP server process, waits for readiness, and then drains the old one. It is the recommended way to pick up code changes without causing transient 502 responses to Notion.
+
+### Persistent macOS launchd install
+
+Use this when the MCP server should stay up even if your shell or tmux pane dies:
+
+```bash
+./scripts/install-launchd.sh
+```
+
+What gets installed:
+
+- one LaunchAgent for the local MCP supervisor
+- one LaunchAgent for `cloudflared tunnel run`
+- automatic restart via `launchd` `KeepAlive` when either process exits
+
+Useful commands after install:
+
+```bash
+./scripts/launchd-status.sh
+./scripts/launchd-reload.sh           # code-only rolling reload via HUP
+./scripts/launchd-restart.sh mcp      # full MCP restart after dependency/env changes
+./scripts/launchd-restart.sh all      # restart MCP + cloudflared
+./scripts/uninstall-launchd.sh
+```
+
+Update workflow:
+
+- Python/code-only changes: `./scripts/launchd-reload.sh`
+- dependency / `.venv` / env changes: `./scripts/launchd-restart.sh mcp`
+- tunnel config changes: `./scripts/launchd-restart.sh cloudflared`
 
 ### Windows Optional Multi-Instance Launcher
 
@@ -276,6 +367,11 @@ cloudflared tunnel --config ./cloudflared-example.yml run <your-tunnel-name>
 | `NOTION_LOCAL_OPS_WORKSPACE_ROOT` | yes | home directory |
 | `NOTION_LOCAL_OPS_STATE_DIR` | no | `~/.notion-local-ops-mcp` |
 | `NOTION_LOCAL_OPS_AUTH_TOKEN` | no | empty |
+| `NOTION_LOCAL_OPS_AUTH_MODE` | no | `shared_token` when `AUTH_TOKEN` is set, otherwise `none` |
+| `NOTION_LOCAL_OPS_PUBLIC_BASE_URL` | required for OAuth | empty |
+| `NOTION_LOCAL_OPS_OAUTH_LOGIN_TOKEN` | no | falls back to `AUTH_TOKEN` |
+| `NOTION_LOCAL_OPS_OAUTH_SCOPES` | no | `local-ops` |
+| `NOTION_LOCAL_OPS_OAUTH_TOKEN_TTL_SECONDS` | no | `86400` |
 | `NOTION_LOCAL_OPS_CLOUDFLARED_CONFIG` | no | empty |
 | `NOTION_LOCAL_OPS_TUNNEL_NAME` | no | empty |
 | `NOTION_LOCAL_OPS_CLOUDFLARED_COMMAND` | no | empty |
@@ -285,6 +381,8 @@ cloudflared tunnel --config ./cloudflared-example.yml run <your-tunnel-name>
 | `NOTION_LOCAL_OPS_COMMAND_TIMEOUT` | no | `120` |
 | `NOTION_LOCAL_OPS_DELEGATE_TIMEOUT` | no | `1800` |
 | `NOTION_LOCAL_OPS_DEBUG_MCP_LOGGING` | no | `0` |
+| `NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS` | no | `30` |
+| `NOTION_LOCAL_OPS_LAUNCHD_LABEL_PREFIX` | no | `com.notion-local-ops` |
 
 ## MCP Tools
 
@@ -293,7 +391,7 @@ cloudflared tunnel --config ./cloudflared-example.yml run <your-tunnel-name>
 - `search`: canonical query tool that unifies glob path search, regex grep, and literal substring search; excludes hidden and `.gitignore`d paths by default and supports regex/text search against a single file path
 - `read_text`: canonical single/batch reader with line-based pagination (`start_line`/`line_limit`), optional `include_line_numbers`, and `language` hint
 - `write_file`: write full file content, supports `dry_run`
-- `apply_patch`: default edit tool for existing files; supports add/update/move/delete patches plus `dry_run`, `validate_only`, and optional diff output
+- `apply_patch`: default edit tool for existing files; uses `*** Begin Patch` / `*** Update File` syntax, rejects pure-context hunks, requires unique context matches, and returns per-file change stats/warnings
 - `server_info`: inspect runtime config and the registered MCP tool list
 - `set_default_cwd`: set session default working directory for subsequent calls
 - `get_default_cwd`: inspect current session/effective working directory
@@ -325,6 +423,7 @@ When enabled, the server log includes `MCP_DEBUG` lines with:
 - session id hint
 - JSON-RPC method
 - tool name for `tools/call`
+- truncated `arguments` summary for `tools/call`
 - response status and duration
 
 ## Verify
@@ -352,6 +451,8 @@ pytest -q tests/test_server_transport.py tests/test_concurrent_clients.py tests/
 - Check the auth type is `Bearer`
 - Check the token matches `NOTION_LOCAL_OPS_AUTH_TOKEN`
 - Check `cloudflared` is still running
+- If you installed the macOS LaunchAgents, start with `./scripts/launchd-status.sh`
+- If you are updating the server while users are connected, prefer `./scripts/dev-tunnel.sh reload` or `./scripts/launchd-reload.sh` over killing the whole tunnel session
 
 ### MCP endpoint works locally but not over tunnel
 
@@ -362,6 +463,12 @@ pytest -q tests/test_server_transport.py tests/test_concurrent_clients.py tests/
 source .venv/bin/activate
 fastmcp list http://127.0.0.1:8766/mcp
 ```
+
+### Notion saw a temporary 502 while you were restarting
+
+- A Cloudflare 502 during restart usually means the origin was briefly unavailable, not that Cloudflare blocked the request
+- If this happened while you manually killed the tmux pane, switch to `./scripts/dev-tunnel.sh reload` so the supervisor overlaps the new server with the old one
+- Check the newest `notion-local-ops-mcp-server.*.log` file to confirm the replacement process reached readiness before the old one drained
 
 ### Logs show repeated 404s
 

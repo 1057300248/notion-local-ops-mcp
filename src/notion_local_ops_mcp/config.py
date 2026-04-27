@@ -98,11 +98,29 @@ STATE_DIR = Path(
     os.environ.get("NOTION_LOCAL_OPS_STATE_DIR", str(Path.home() / ".notion-local-ops-mcp"))
 ).expanduser().resolve()
 AUTH_TOKEN = os.environ.get("NOTION_LOCAL_OPS_AUTH_TOKEN", "").strip()
+AUTH_MODE = os.environ.get("NOTION_LOCAL_OPS_AUTH_MODE", "").strip().lower()
+PUBLIC_BASE_URL = os.environ.get("NOTION_LOCAL_OPS_PUBLIC_BASE_URL", "").strip().rstrip("/")
+OAUTH_LOGIN_TOKEN = os.environ.get("NOTION_LOCAL_OPS_OAUTH_LOGIN_TOKEN", "").strip()
+OAUTH_SCOPES = tuple(
+    scope
+    for scope in os.environ.get("NOTION_LOCAL_OPS_OAUTH_SCOPES", "local-ops").split()
+    if scope
+)
+OAUTH_TOKEN_TTL_SECONDS = _env_int(
+    "NOTION_LOCAL_OPS_OAUTH_TOKEN_TTL_SECONDS",
+    86400,
+    min_value=60,
+)
 CODEX_COMMAND = os.environ.get("NOTION_LOCAL_OPS_CODEX_COMMAND", "codex").strip()
 CLAUDE_COMMAND = os.environ.get("NOTION_LOCAL_OPS_CLAUDE_COMMAND", "claude").strip()
 COMMAND_TIMEOUT = _env_int("NOTION_LOCAL_OPS_COMMAND_TIMEOUT", 120, min_value=1)
 DELEGATE_TIMEOUT = _env_int("NOTION_LOCAL_OPS_DELEGATE_TIMEOUT", 1800, min_value=1)
 DEBUG_MCP_LOGGING = _env_flag("NOTION_LOCAL_OPS_DEBUG_MCP_LOGGING", default=False)
+GRACEFUL_SHUTDOWN_SECONDS = _env_int(
+    "NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS",
+    30,
+    min_value=1,
+)
 
 # HTTP keep-alive timeout for uvicorn (None = unlimited/infinite)
 # Set to a positive integer (e.g., 3600) to enforce a max idle time

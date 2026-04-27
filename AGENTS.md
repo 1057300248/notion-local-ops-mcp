@@ -19,14 +19,15 @@ Notion Agent ──HTTP/SSE compat──▶ FastMCP Server (uvicorn)
 
 ```
 src/notion_local_ops_mcp/
-├── server.py      # FastMCP app, tool registration, uvicorn entrypoint
+├── server.py      # FastMCP app, tool registration, uvicorn entrypoint / fd-aware child
 ├── config.py      # All env-var driven settings (host, port, paths, timeouts…)
 ├── pathing.py     # Path resolution: relative → absolute under WORKSPACE_ROOT
 ├── files.py       # list_files, read_text, write_file, internal replace helpers
 ├── search.py      # search implementations (glob/regex/text)
 ├── shell.py       # run_command — subprocess with timeout
 ├── tasks.py       # TaskStore — persistent task metadata & logs on disk
-└── executors.py   # ExecutorRegistry — async delegate_task via codex / claude-code
+├── executors.py   # ExecutorRegistry — async delegate_task via codex / claude-code
+└── supervisor.py  # Rolling-reload supervisor for dev-tunnel / local hot restarts
 ```
 
 ## Tools exposed
@@ -39,7 +40,7 @@ src/notion_local_ops_mcp/
 | `search` | Canonical unified query tool (glob/regex/text); hides hidden and `.gitignore`d paths by default and supports regex/text against a single file |
 | `read_text` | Canonical single/batch text reader with line pagination and optional line numbers |
 | `write_file` | Create or overwrite a file (`dry_run` supported) |
-| `apply_patch` | Default edit tool for existing files; supports validation/dry-run |
+| `apply_patch` | Default edit tool for existing files; rejects pure-context hunks, requires unique matches, and supports validation/dry-run |
 | `git_status` / `git_diff` / `git_commit` / `git_log` / `git_show` / `git_blame` | Structured git workflows (when cwd is actually inside a git repo) |
 | `run_command` | Execute a shell command (sync or background) |
 | `run_command_stream` | Start long shell command and poll via task id |
@@ -78,6 +79,7 @@ src/notion_local_ops_mcp/
 | `NOTION_LOCAL_OPS_COMMAND_TIMEOUT` | `120` | Default shell command timeout (seconds) |
 | `NOTION_LOCAL_OPS_DELEGATE_TIMEOUT` | `1800` | Default delegate task timeout (seconds) |
 | `NOTION_LOCAL_OPS_DEBUG_MCP_LOGGING` | `0` | Enable verbose MCP method/tool logging for handshake/debug sessions |
+| `NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS` | `30` | Graceful drain window when the rolling-reload supervisor swaps child servers |
 
 ## Quick start
 
@@ -86,6 +88,9 @@ cp .env.example .env   # edit values
 python -m venv .venv && source .venv/bin/activate
 pip install -e .
 notion-local-ops-mcp   # starts the streamable-http MCP server on :8766/mcp (legacy SSE compatibility enabled)
+# optional tunnel + rolling reload workflow:
+./scripts/dev-tunnel.sh
+# in another shell, use ./scripts/dev-tunnel.sh reload for rolling restarts
 ```
 
 ## Dev

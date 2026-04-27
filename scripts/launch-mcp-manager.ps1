@@ -776,7 +776,7 @@ function Test-QuickTunnelEdgeFailure {
 function Wait-ForQuickTunnelUrl {
     param([string[]]$LogPaths, [int]$TimeoutSeconds = 45, [int]$ProcessId = 0)
     $script:LastQuickTunnelFailureInfo = $null
-    $quickTunnelPattern = 'https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com'
+    $quickTunnelPattern = '(https://(?!api\.)[a-z0-9-]+\.trycloudflare\.com|http://127\.0\.0\.1:\d+)'
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $combined = ''
     while ((Get-Date) -lt $deadline) {
@@ -785,6 +785,7 @@ function Wait-ForQuickTunnelUrl {
             $quickMatches = [regex]::Matches($combined, $quickTunnelPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
             if ($quickMatches.Count -gt 0) {
                 $quickUrl = $quickMatches[$quickMatches.Count - 1].Value
+                if ($quickUrl -match '^http://127\.0\.0\.1:\d+$') { return $quickUrl }
                 if (Test-QuickTunnelEdgeReady -Text $combined) { return $quickUrl }
                 if (Test-QuickTunnelEdgeFailure -Text $combined) {
                     $script:LastQuickTunnelFailureInfo = [pscustomobject]@{
@@ -1038,6 +1039,7 @@ function Start-QuickTunnel {
     $Instance.NextTunnelStartAttemptAt = ''
     $Instance.LastFailureReason = ''
     if (-not [string]::IsNullOrWhiteSpace($oldPublicMcpUrl) -and $oldPublicMcpUrl -ne $Instance.PublicMcpUrl) {
+        $Instance.RestartCount = [int]$Instance.RestartCount + 1
         $Instance.NeedsNotionUrlUpdate = $true
         $Instance.UrlChangedAt = (Get-Date).ToString('o')
     }
@@ -1839,6 +1841,22 @@ if ($instances.Count -eq 0) {
 
 Write-Host ''
 Write-Host 'Instances ready. Monitoring local health + public MCP probe...' -ForegroundColor Green
+$initialRows = @($instances | ForEach-Object { Get-InstanceStatus -Instance $_ })
+Write-LauncherState `
+    -LauncherStatePath $launcherStatePath `
+    -Instances $instances `
+    -RequestedCount $count `
+    -RequestedBasePort $requestedBasePort `
+    -BindHost $bindHost `
+    -WorkspaceRoot $workspaceRoot
+Write-StatusSnapshot `
+    -StatusPath $statusPath `
+    -Rows $initialRows `
+    -RequestedCount $count `
+    -RequestedBasePort $requestedBasePort `
+    -BindHost $bindHost `
+    -WorkspaceRoot $workspaceRoot `
+    -LauncherStatePath $launcherStatePath
 Start-Sleep -Seconds 1
 
 $cycle = 0
