@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import AsyncExitStack, asynccontextmanager
 from importlib.metadata import PackageNotFoundError, version as package_version
+import hmac
 import json
 import logging
 import sys
@@ -69,10 +70,14 @@ def _extract_bearer_token(authorization: str) -> str:
 
 
 def _base_url_from_headers(headers: Headers, scheme: str = "https") -> str:
+    # Only X-Forwarded-Proto is consulted (cloudflared terminates TLS and forwards
+    # plain HTTP, so the header is the only way to learn the original scheme).
+    # X-Forwarded-Host is intentionally NOT trusted: an attacker hitting the
+    # tunnel with a spoofed value could otherwise redirect OAuth metadata to a
+    # phishing host. For safe issuer URLs, set NOTION_LOCAL_OPS_PUBLIC_BASE_URL.
     forwarded_proto = headers.get("x-forwarded-proto", "").split(",", 1)[0].strip()
-    forwarded_host = headers.get("x-forwarded-host", "").split(",", 1)[0].strip()
     proto = forwarded_proto or scheme
-    host = forwarded_host or headers.get("host", "")
+    host = headers.get("host", "").strip()
     return f"{proto}://{host}".rstrip("/")
 
 
@@ -355,7 +360,8 @@ class HTTPBearerAuthMiddleware:
 
         provided = _extract_bearer_token(Headers(raw=scope.get("headers", [])).get("authorization", ""))
         if auth_mode == "shared_token":
-            if provided == (self._get_auth_token() or "").strip():
+            expected = (self._get_auth_token() or "").strip()
+            if expected and provided and hmac.compare_digest(provided, expected):
                 await self.app(scope, receive, send)
                 return
             await self._unauthorized(scope, receive, send, oauth=False)
@@ -365,7 +371,11 @@ class HTTPBearerAuthMiddleware:
             headers = Headers(raw=scope.get("headers", []))
             fallback_base_url = _base_url_from_headers(headers, str(scope.get("scheme", "https")))
             base_url = self._oauth_manager.metadata_base_url(fallback_base_url)
-            static_token_matches = bool(provided and config.auth_token and provided == config.auth_token)
+            static_token_matches = bool(
+                provided
+                and config.auth_token
+                and hmac.compare_digest(provided, config.auth_token)
+            )
             oauth_token_matches = self._oauth_manager.verify_access_token(provided, base_url=base_url)
             if static_token_matches or oauth_token_matches:
                 await self.app(scope, receive, send)

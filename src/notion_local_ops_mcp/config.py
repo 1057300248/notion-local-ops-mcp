@@ -140,3 +140,7 @@ def ensure_runtime_directories() -> None:
     if not WORKSPACE_ROOT.is_dir():
         raise NotADirectoryError(f"Default cwd is not a directory: {WORKSPACE_ROOT}")
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        STATE_DIR.chmod(0o700)
+    except OSError:
+        pass

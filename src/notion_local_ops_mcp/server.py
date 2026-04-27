@@ -851,6 +851,25 @@ def main(argv: list[str] | None = None) -> None:
     print(f"debug_mcp_logging={DEBUG_MCP_LOGGING}")
     print(f"timeout_keep_alive={HTTP_KEEPALIVE_TIMEOUT}")
     print(f"graceful_shutdown_seconds={GRACEFUL_SHUTDOWN_SECONDS}")
+
+    oauth_config = _current_oauth_config()
+    if oauth_config.normalized_auth_mode == "oauth":
+        if not oauth_config.public_base_url:
+            print(
+                "WARNING: NOTION_LOCAL_OPS_PUBLIC_BASE_URL is not set; OAuth "
+                "metadata will fall back to the request Host header. Set it to "
+                "your public tunnel URL (e.g. https://mcp.example.com) so issuer "
+                "URLs cannot be spoofed."
+            )
+        if not oauth_config.oauth_login_token and oauth_config.auth_token:
+            print(
+                "WARNING: NOTION_LOCAL_OPS_OAUTH_LOGIN_TOKEN is not set; "
+                "AUTH_TOKEN is being reused as the OAuth login token. Anyone "
+                "with AUTH_TOKEN can mint long-TTL OAuth access tokens. After "
+                "rotating AUTH_TOKEN, also clear oauth.json[\"tokens\"] under "
+                f"{STATE_DIR}/oauth.json."
+            )
+
     server = build_uvicorn_server(fd=args.fd, ready_fd=_consume_ready_fd())
     server.run()
 

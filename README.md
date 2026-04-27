@@ -82,6 +82,22 @@ The first two commands should return JSON metadata. The `/mcp` request without
 credentials should return `401` with a `WWW-Authenticate` header containing
 `resource_metadata`.
 
+### OAuth security notes
+
+- **Always set `NOTION_LOCAL_OPS_PUBLIC_BASE_URL`** in OAuth mode. Without it
+  the issuer URL falls back to the request `Host` header, which a tunnel
+  attacker can spoof to steer OAuth metadata at a phishing host. The server
+  prints a startup warning when this happens.
+- **Prefer a dedicated `NOTION_LOCAL_OPS_OAUTH_LOGIN_TOKEN`.** If it falls back
+  to `AUTH_TOKEN`, anyone who briefly sees `AUTH_TOKEN` can mint a long-TTL
+  OAuth access token (default 24h) that survives a token rotation. After
+  rotating `AUTH_TOKEN`, also clear the `tokens` map in
+  `<STATE_DIR>/oauth.json` to invalidate any minted access tokens.
+- `oauth.json` and the `STATE_DIR` task tree are written with `0o600`/`0o700`
+  permissions so other local users cannot read minted tokens or task logs.
+  Existing files created before this change should be `chmod`'d manually
+  (`chmod 600 ~/.notion-local-ops-mcp/oauth.json`).
+
 Use the prompt below for the **MCP Agent**. It is not for the Notion AI instruction page.
 
 <details>

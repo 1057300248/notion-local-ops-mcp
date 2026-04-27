@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import stat
 from pathlib import Path
 
 from notion_local_ops_mcp.launchd_support import (
@@ -9,6 +10,7 @@ from notion_local_ops_mcp.launchd_support import (
     mcp_service_label,
     cloudflared_service_label,
     plist_path,
+    write_launch_agent,
 )
 
 
@@ -101,3 +103,14 @@ def test_launchd_label_helpers_and_plist_path(tmp_path: Path) -> None:
     assert plist_path(launch_agents_dir, mcp_service_label(prefix)) == (
         launch_agents_dir / "com.example.notion-local-ops.mcp.plist"
     )
+
+
+def test_write_launch_agent_locks_down_plist_permissions(tmp_path: Path) -> None:
+    target = tmp_path / "LaunchAgents" / "com.example.mcp.plist"
+    payload = {"Label": "com.example.mcp", "RunAtLoad": True}
+
+    write_launch_agent(target, payload)
+
+    assert target.exists()
+    file_mode = stat.S_IMODE(target.stat().st_mode)
+    assert file_mode == 0o600, f"plist mode={oct(file_mode)} (expected 0o600)"

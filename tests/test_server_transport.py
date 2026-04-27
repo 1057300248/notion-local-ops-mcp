@@ -6,6 +6,7 @@ import hashlib
 import logging
 import secrets
 import socket
+import stat
 import threading
 import time
 from pathlib import Path
@@ -216,6 +217,91 @@ def test_http_app_does_not_require_auth_for_oauth_discovery_probe(monkeypatch) -
         response = client.get("/.well-known/oauth-authorization-server")
 
     assert response.status_code == 404
+
+
+def test_shared_token_mode_rejects_when_auth_token_is_empty(monkeypatch) -> None:
+    # Guard against an empty/misconfigured AUTH_TOKEN silently allowing requests
+    # that omit the Authorization header (both sides would compare equal as "").
+    monkeypatch.setattr(server, "AUTH_MODE", "shared_token")
+    monkeypatch.setattr(server, "AUTH_TOKEN", "")
+    app = build_http_app()
+
+    with TestClient(app) as client:
+        response = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
+
+    assert response.status_code == 401
+
+
+def test_oauth_metadata_does_not_trust_x_forwarded_host(monkeypatch, tmp_path) -> None:
+    # Without PUBLIC_BASE_URL the issuer URL falls back to the request's Host
+    # header, but X-Forwarded-Host must NOT be honored: a tunnel attacker could
+    # otherwise redirect the OAuth metadata to a phishing host.
+    monkeypatch.setattr(server, "AUTH_MODE", "oauth")
+    monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    monkeypatch.setattr(server, "PUBLIC_BASE_URL", "")
+    monkeypatch.setattr(server, "STATE_DIR", tmp_path)
+    app = build_http_app()
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/.well-known/oauth-authorization-server",
+            headers={"X-Forwarded-Host": "attacker.example", "X-Forwarded-Proto": "https"},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "attacker.example" not in body["issuer"]
+    assert "attacker.example" not in body["authorization_endpoint"]
+
+
+def test_oauth_register_enforces_client_limit(monkeypatch, tmp_path) -> None:
+    from notion_local_ops_mcp.oauth import MAX_REGISTERED_CLIENTS
+
+    monkeypatch.setattr(server, "AUTH_MODE", "oauth")
+    monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    monkeypatch.setattr(server, "PUBLIC_BASE_URL", "https://mcp.example.test")
+    monkeypatch.setattr(server, "STATE_DIR", tmp_path)
+    app = build_http_app()
+
+    payload = {
+        "client_name": "ChatGPT",
+        "redirect_uris": ["https://chat.openai.com/aip/callback"],
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    }
+
+    with TestClient(app) as client:
+        for _ in range(MAX_REGISTERED_CLIENTS):
+            ok = client.post("/oauth/register", json=payload)
+            assert ok.status_code == 201
+        rejected = client.post("/oauth/register", json=payload)
+
+    assert rejected.status_code == 400
+    assert rejected.json()["error"] == "invalid_client_metadata"
+
+
+def test_oauth_store_file_permissions_are_locked_down(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(server, "AUTH_MODE", "oauth")
+    monkeypatch.setattr(server, "AUTH_TOKEN", "secret-token")
+    monkeypatch.setattr(server, "PUBLIC_BASE_URL", "https://mcp.example.test")
+    monkeypatch.setattr(server, "STATE_DIR", tmp_path)
+    app = build_http_app()
+
+    with TestClient(app) as client:
+        registration = client.post(
+            "/oauth/register",
+            json={
+                "client_name": "ChatGPT",
+                "redirect_uris": ["https://chat.openai.com/aip/callback"],
+            },
+        )
+
+    assert registration.status_code == 201
+    oauth_path = tmp_path / "oauth.json"
+    assert oauth_path.exists()
+    file_mode = stat.S_IMODE(oauth_path.stat().st_mode)
+    assert file_mode == 0o600, f"oauth.json mode={oct(file_mode)} (expected 0o600)"
 
 
 def test_http_app_exposes_minimal_oauth_metadata(monkeypatch, tmp_path) -> None:

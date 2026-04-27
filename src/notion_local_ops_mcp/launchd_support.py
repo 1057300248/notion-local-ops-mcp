@@ -115,3 +115,7 @@ def build_cloudflared_launch_agent(config: LaunchdServiceConfig) -> dict[str, An
 def write_launch_agent(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(plistlib.dumps(dict(payload), sort_keys=False))
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass

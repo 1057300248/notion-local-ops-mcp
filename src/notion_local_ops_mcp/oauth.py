@@ -14,6 +14,7 @@ from urllib.parse import urlencode, urlparse
 
 
 DEFAULT_SCOPE = "local-ops"
+MAX_REGISTERED_CLIENTS = 50
 
 
 @dataclass(frozen=True)
@@ -90,9 +91,15 @@ class OAuthManager:
         if not all(isinstance(uri, str) and _is_allowed_redirect_uri(uri) for uri in redirect_uris):
             raise ValueError("redirect_uris must use https or localhost")
 
+        store = self._read_store()
+        if len(store["clients"]) >= MAX_REGISTERED_CLIENTS:
+            raise ValueError(
+                f"too many registered OAuth clients (limit {MAX_REGISTERED_CLIENTS}); "
+                "remove unused entries from oauth.json or raise the limit"
+            )
+
         client_id = "mcp_client_" + secrets.token_urlsafe(24)
         now = int(time.time())
-        store = self._read_store()
         store["clients"][client_id] = {
             "client_id": client_id,
             "client_name": str(payload.get("client_name") or "ChatGPT"),
@@ -253,8 +260,16 @@ class OAuthManager:
 
     def _write_store(self, store: dict[str, Any]) -> None:
         self.store_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.store_path.parent.chmod(0o700)
+        except OSError:
+            pass
         tmp_path = self.store_path.with_suffix(".json.tmp")
         tmp_path.write_text(json.dumps(store, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        try:
+            tmp_path.chmod(0o600)
+        except OSError:
+            pass
         tmp_path.replace(self.store_path)
 
 
