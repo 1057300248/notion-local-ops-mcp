@@ -7,6 +7,16 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/launchd-common.sh"
 prepare_launchd_env
 require_command launchctl
 
+resolve_host_system() {
+  local host="$1"
+  if command -v dig >/dev/null 2>&1; then
+    dig +time=3 +tries=1 +short "${host}" A 2>/dev/null | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && return 0
+    dig +time=3 +tries=1 +short "${host}" AAAA 2>/dev/null | grep -Eq ':' && return 0
+    return 1
+  fi
+  return 0
+}
+
 for label in "$(mcp_label)" "$(cloudflared_label)" "$(watchdog_label)"; do
   target="$(launchctl_target "${label}")"
   echo "=== ${target} ==="
@@ -31,6 +41,11 @@ if CLOUDFLARED_CONFIG="$(pick_cloudflared_config 2>/dev/null || true)"; then
   if [[ -n "${hostname}" ]]; then
     echo
     echo "=== public MCP ==="
+    if resolve_host_system "${hostname}"; then
+      echo "DNS OK: ${hostname}"
+    else
+      echo "DNS FAIL: system resolver cannot resolve ${hostname}"
+    fi
     if curl -fsSI --max-time 10 "https://${hostname}/mcp" >/dev/null 2>&1; then
       curl -sSI --max-time 10 "https://${hostname}/mcp" | sed -n '1,12p'
     else

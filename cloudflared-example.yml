@@ -1,3 +1,5 @@
+protocol: http2
+edge-ip-version: "auto"
 tunnel: <your-tunnel-id>
 credentials-file: /absolute/path/to/<your-tunnel-id>.json
 

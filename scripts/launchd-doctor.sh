@@ -64,6 +64,7 @@ MCP_TARGET="$(launchctl_target "${MCP_LABEL}")"
 CLOUDFLARED_TARGET="$(launchctl_target "${CLOUDFLARED_LABEL}")"
 LOCAL_URL="http://${NOTION_LOCAL_OPS_HOST}:${NOTION_LOCAL_OPS_PORT}/mcp"
 PUBLIC_URL=""
+PUBLIC_HOSTNAME=""
 
 log() {
   if [[ "${QUIET}" != "1" ]]; then
@@ -85,6 +86,7 @@ if CLOUDFLARED_CONFIG="$(pick_cloudflared_config 2>/dev/null || true)"; then
     }
   ' "${CLOUDFLARED_CONFIG}" 2>/dev/null || true)"
   if [[ -n "${hostname}" ]]; then
+    PUBLIC_HOSTNAME="${hostname}"
     PUBLIC_URL="https://${hostname}/mcp"
   fi
 fi
@@ -92,6 +94,20 @@ fi
 service_loaded() {
   local target="$1"
   launchctl print "${target}" >/dev/null 2>&1
+}
+
+resolve_host_system() {
+  local host="$1"
+  if command -v dig >/dev/null 2>&1; then
+    dig +time=3 +tries=1 +short "${host}" A 2>/dev/null | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && return 0
+    dig +time=3 +tries=1 +short "${host}" AAAA 2>/dev/null | grep -Eq ':' && return 0
+    return 1
+  fi
+  if command -v dscacheutil >/dev/null 2>&1; then
+    dscacheutil -q host -a name "${host}" >/dev/null 2>&1
+    return $?
+  fi
+  return 0
 }
 
 head_ok_direct() {
@@ -276,6 +292,12 @@ if [[ -z "${PUBLIC_URL}" ]]; then
 fi
 
 log "=== public MCP ==="
+if [[ -n "${PUBLIC_HOSTNAME}" ]] && ! resolve_host_system "${PUBLIC_HOSTNAME}"; then
+  warn "System DNS cannot resolve ${PUBLIC_HOSTNAME}; not treating this as a cloudflared failure. Check system DNS before restarting tunnel."
+  save_state
+  exit 1
+fi
+
 if head_ok_direct "${PUBLIC_URL}" 10; then
   log "OK direct ${PUBLIC_URL}"
   reset_public_state
@@ -287,6 +309,9 @@ state_public_failures=$(( state_public_failures + 1 ))
 warn "Public /mcp direct check failed while local /mcp is healthy: ${PUBLIC_URL}"
 if head_ok_env "${PUBLIC_URL}" 10; then
   warn "Public /mcp succeeds with current proxy env; treating this as local egress/proxy-path mismatch, not cloudflared failure."
+  reset_public_state
+  save_state
+  exit 0
 else
   warn "Public /mcp also fails with current proxy env."
 fi

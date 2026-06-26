@@ -110,6 +110,28 @@ Output style:
 
 </details>
 
+## Relay 桥接（把工具调用镜像到 dashboard）
+
+和 [workspace-agent-relay-mcp](https://github.com/catoncat/workspace-agent-relay-mcp) 配合时，agent 在这里每调一次工具，都会自动镜像到那个 relay 的实时 dashboard——本地操作者能看着 agent 干活，agent 完全不用手动汇报。
+
+工作原理：
+
+1. agent 在这里调 `bind_relay_run`，传入 relay trigger 给的 `request_id` + `callback_token`（不用传 relay 地址，本地已配好）。
+2. 之后每个 `@traced` 工具调用都会异步发一个 `POST /internal/tool-trace` 给 relay。
+3. relay 存下来并通过 SSE 推到 dashboard。
+
+这是一个**通用 instrumentation 层**（`@traced` 装饰器 + 可插拔 sink），relay 只是其中一个 sink，并非硬编码。relay 不可达绝不阻塞工具执行——trace 是尽力而为。
+
+环境变量：
+
+```bash
+NOTION_LOCAL_OPS_RELAY_BRIDGE_ENABLED=true        # 默认 true；设 false 完全关闭
+NOTION_LOCAL_OPS_RELAY_URL=http://127.0.0.1:8799  # bind_relay_run 默认用的 relay 地址
+NOTION_LOCAL_OPS_RELAY_BRIDGE_TIMEOUT=1.5         # 秒，trace POST 的超时上限
+```
+
+`bind_relay_run` / `clear_relay_run` 是给 agent 用的控制工具；`server_info` 暴露 `relay_bridge` 状态（enabled、bound、dropped_traces 等）。关闭或未绑定时，行为零变化。
+
 ## 可选应用场景
 
 如果你还想使用 **Notion AI 页面级指令 + 项目管理** 这套工作流，见：
@@ -356,6 +378,11 @@ cloudflared tunnel --config ./cloudflared-example.yml run <your-tunnel-name>
 - `wait_task`：阻塞等待后台 shell 任务或委托任务完成或超时
 - `cancel_task`：停止后台 shell 任务或委托任务
 - `purge_tasks`：清理 `STATE_DIR/tasks` 下的旧任务产物（支持 `dry_run`）
+
+Relay 桥接控制工具（见 [Relay 桥接](#relay-桥接把工具调用镜像到-dashboard)）：
+
+- `bind_relay_run`：把当前进程绑定到一个 relay run，之后工具调用自动镜像
+- `clear_relay_run`：解绑；等价于 `bind_relay_run` 传空 `request_id`
 
 ## 调试 Notion / MCP 握手卡住
 

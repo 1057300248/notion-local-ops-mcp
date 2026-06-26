@@ -67,6 +67,20 @@ GRACEFUL_SHUTDOWN_SECONDS = int(
     os.environ.get("NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS", "30")
 )
 
+# Relay bridge: when enabled and a relay run is bound (see session.set_bound_run),
+# each traced tool call fires a fire-and-forget HTTP trace to the relay's
+# /internal/tool-trace endpoint so a local operator can watch tool calls in
+# real time. Disabled or unbound => zero behavior change.
+RELAY_BRIDGE_ENABLED = _env_flag("NOTION_LOCAL_OPS_RELAY_BRIDGE_ENABLED", default=True)
+RELAY_BRIDGE_TIMEOUT = float(
+    os.environ.get("NOTION_LOCAL_OPS_RELAY_BRIDGE_TIMEOUT", "1.5")
+)
+# Default relay endpoint used when bind_relay_run is called without an explicit
+# relay_url. Lets the agent omit the relay address entirely (it only needs to
+# pass request_id + callback_token), keeping the relay host/port a deployment
+# detail rather than something baked into agent instructions.
+RELAY_URL = os.environ.get("NOTION_LOCAL_OPS_RELAY_URL", "http://127.0.0.1:8799").strip().rstrip("/")
+
 
 def ensure_runtime_directories() -> None:
     if not WORKSPACE_ROOT.exists():

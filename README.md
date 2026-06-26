@@ -172,6 +172,28 @@ Output style:
 
 </details>
 
+## Relay Bridge (mirror tool calls to a dashboard)
+
+When paired with [workspace-agent-relay-mcp](https://github.com/catoncat/workspace-agent-relay-mcp), every tool call an agent makes here can be auto-mirrored to that relay's live dashboard — so a local operator watches the agent work without it manually reporting anything.
+
+How it works:
+
+1. The agent calls `bind_relay_run` here with the `request_id` + `callback_token` from a relay trigger (no relay URL needed — it's configured locally).
+2. Every `@traced` tool call thereafter fires a fire-and-forget `POST /internal/tool-trace` to the relay.
+3. The relay stores it and pushes it to the dashboard over SSE.
+
+It's a **generic instrumentation layer** (`@traced` decorator + pluggable sinks), so the relay is just one sink — not hardcoded. The relay being unreachable never blocks tool execution; traces are best-effort.
+
+Env knobs:
+
+```bash
+NOTION_LOCAL_OPS_RELAY_BRIDGE_ENABLED=true     # default true; set false to disable entirely
+NOTION_LOCAL_OPS_RELAY_URL=http://127.0.0.1:8799  # default relay endpoint used by bind_relay_run
+NOTION_LOCAL_OPS_RELAY_BRIDGE_TIMEOUT=1.5       # seconds, caps the trace POST
+```
+
+`bind_relay_run` / `clear_relay_run` are the agent-facing controls; `server_info` exposes `relay_bridge` state (enabled, bound, dropped_traces, …). Disabled or unbound => zero behavior change.
+
 ## Optional Use Case
 
 If you also want the **Notion AI instruction page + project-management** workflow, see:
@@ -425,6 +447,11 @@ cloudflared tunnel --config ./cloudflared-example.yml run <your-tunnel-name>
 - `wait_task`: block until a delegated or background shell task completes or times out
 - `cancel_task`: stop a delegated or background shell task
 - `purge_tasks`: clean old task artifacts from `STATE_DIR/tasks` with dry-run support
+
+Relay bridge controls (see [Relay Bridge](#relay-bridge-mirror-tool-calls-to-a-dashboard)):
+
+- `bind_relay_run`: bind the current process to a relay run so subsequent tool calls are mirrored
+- `clear_relay_run`: unbind; equivalent to `bind_relay_run` with a null `request_id`
 
 ## Debugging Notion / MCP handshake issues
 
