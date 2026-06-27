@@ -26,6 +26,7 @@ from .config import (
     PORT,
     PUBLIC_BASE_URL,
     RELAY_BRIDGE_ENABLED,
+    RELAY_BINDING_TTL_SECONDS,
     RELAY_BRIDGE_TIMEOUT,
     RELAY_URL,
     STATE_DIR,
@@ -454,6 +455,7 @@ async def server_info() -> dict[str, object]:
         "relay_bridge": {
             "enabled": bool(RELAY_BRIDGE_ENABLED),
             "timeout_seconds": float(RELAY_BRIDGE_TIMEOUT),
+            "binding_ttl_seconds": float(RELAY_BINDING_TTL_SECONDS),
             "default_relay_url": RELAY_URL,
             "bound": binding is not None,
             "request_id": binding.get("request_id") if binding else None,

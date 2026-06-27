@@ -75,6 +75,9 @@ RELAY_BRIDGE_ENABLED = _env_flag("NOTION_LOCAL_OPS_RELAY_BRIDGE_ENABLED", defaul
 RELAY_BRIDGE_TIMEOUT = float(
     os.environ.get("NOTION_LOCAL_OPS_RELAY_BRIDGE_TIMEOUT", "1.5")
 )
+RELAY_BINDING_TTL_SECONDS = float(
+    os.environ.get("NOTION_LOCAL_OPS_RELAY_BINDING_TTL_SECONDS", "3600")
+)
 # Default relay endpoint used when bind_relay_run is called without an explicit
 # relay_url. Lets the agent omit the relay address entirely (it only needs to
 # pass request_id + callback_token), keeping the relay host/port a deployment

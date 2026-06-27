@@ -10,6 +10,7 @@ Failure semantics (per the bridge design):
 
 - No binding -> immediate return, no HTTP, no error.
 - Bridge disabled via ``RELAY_BRIDGE_ENABLED`` -> immediate return.
+- Expired binding -> clear the binding, no HTTP, no error.
 - Any HTTP failure (timeout, connection refused, 4xx/5xx, DNS, ...) -> swallowed
   silently and ``dropped_traces`` is incremented. The tool call that triggered
   the trace is never affected.
@@ -24,6 +25,7 @@ import json
 import threading
 import urllib.error
 import urllib.request
+from datetime import UTC, datetime
 from typing import Any
 
 from . import config, session
@@ -73,12 +75,14 @@ class RelayBridgeSink:
         *,
         timeout: float | None = None,
         enabled: bool | None = None,
+        binding_ttl_seconds: float | None = None,
     ) -> None:
         # Resolve config at construction time for the defaults, but re-read the
         # enabled flag per-event so flipping the env var + reloading is honored
         # without restarting. ``None`` means "defer to config each call".
         self._default_timeout = timeout
         self._default_enabled = enabled
+        self._default_binding_ttl_seconds = binding_ttl_seconds
 
     def _enabled(self) -> bool:
         if self._default_enabled is not None:
@@ -90,11 +94,35 @@ class RelayBridgeSink:
             return float(self._default_timeout)
         return float(getattr(config, "RELAY_BRIDGE_TIMEOUT", 1.5))
 
+    def _binding_ttl_seconds(self) -> float:
+        if self._default_binding_ttl_seconds is not None:
+            return float(self._default_binding_ttl_seconds)
+        return float(getattr(config, "RELAY_BINDING_TTL_SECONDS", 3600))
+
+    def _binding_expired(self, binding: dict[str, object]) -> bool:
+        ttl_seconds = self._binding_ttl_seconds()
+        if ttl_seconds <= 0:
+            return False
+        bound_at = binding.get("bound_at")
+        if not isinstance(bound_at, str) or not bound_at:
+            return False
+        try:
+            bound_at_dt = datetime.fromisoformat(bound_at)
+        except ValueError:
+            return False
+        if bound_at_dt.tzinfo is None:
+            bound_at_dt = bound_at_dt.replace(tzinfo=UTC)
+        age_seconds = (datetime.now(UTC) - bound_at_dt.astimezone(UTC)).total_seconds()
+        return age_seconds > ttl_seconds
+
     def on_tool_event(self, event: ToolEvent) -> None:
         if not self._enabled():
             return
         binding = session.get_bound_run()
         if not binding:
+            return
+        if self._binding_expired(binding):
+            session.clear_bound_run()
             return
         relay_url = binding.get("relay_url")
         if not isinstance(relay_url, str) or not relay_url:

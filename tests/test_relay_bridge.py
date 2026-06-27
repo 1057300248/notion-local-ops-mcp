@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
@@ -285,6 +286,35 @@ def test_sink_no_binding_makes_no_http(stub_relay: _StubServer) -> None:
     assert stub_relay.captured == []
 
 
+def test_sink_expired_binding_clears_without_http(stub_relay: _StubServer) -> None:
+    session.set_bound_run(
+        {
+            "request_id": "run_old",
+            "callback_token": "tok_old",
+            "relay_url": stub_relay.url,
+            "conversation_key": "conv_old",
+            "bound_at": (datetime.now(UTC) - timedelta(seconds=120)).isoformat(),
+        }
+    )
+
+    sink = RelayBridgeSink(binding_ttl_seconds=60)
+    sink.on_tool_event(
+        ToolEvent(
+            tool="run_command",
+            title="run_command",
+            args_summary={},
+            result_summary=None,
+            started_at="t",
+            duration_ms=1,
+            ok=True,
+        )
+    )
+
+    assert stub_relay.captured == []
+    assert session.get_bound_run() is None
+    assert relay_bridge.get_dropped_traces() == 0
+
+
 def test_sink_http_failure_does_not_raise_and_increments_dropped(stub_relay: _StubServer) -> None:
     session.set_bound_run(
         {
@@ -442,6 +472,7 @@ def test_dropped_traces_counter_is_observable_in_server_info() -> None:
     assert info["success"] is True
     rb = info["relay_bridge"]
     assert rb["enabled"] is True
+    assert rb["binding_ttl_seconds"] > 0
     assert rb["dropped_traces"] == 0
     assert "bind_relay_run" in info["tools"]
     assert "clear_relay_run" in info["tools"]

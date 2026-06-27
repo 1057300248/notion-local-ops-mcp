@@ -190,6 +190,7 @@ Env knobs:
 NOTION_LOCAL_OPS_RELAY_BRIDGE_ENABLED=true     # default true; set false to disable entirely
 NOTION_LOCAL_OPS_RELAY_URL=http://127.0.0.1:8799  # default relay endpoint used by bind_relay_run
 NOTION_LOCAL_OPS_RELAY_BRIDGE_TIMEOUT=1.5       # seconds, caps the trace POST
+NOTION_LOCAL_OPS_RELAY_BINDING_TTL_SECONDS=3600 # seconds, clears old bindings before posting traces
 ```
 
 `bind_relay_run` / `clear_relay_run` are the agent-facing controls; `server_info` exposes `relay_bridge` state (enabled, bound, dropped_traces, …). Disabled or unbound => zero behavior change.
