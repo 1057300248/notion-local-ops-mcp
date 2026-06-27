@@ -312,6 +312,36 @@ def test_sink_http_failure_does_not_raise_and_increments_dropped(stub_relay: _St
     )
 
     assert relay_bridge.get_dropped_traces() == before + 1
+    assert session.get_bound_run() is not None
+
+
+def test_sink_stale_binding_http_status_clears_binding(stub_relay: _StubServer) -> None:
+    session.set_bound_run(
+        {
+            "request_id": "run_superseded",
+            "callback_token": "tok",
+            "relay_url": stub_relay.url,
+            "conversation_key": "conv",
+        }
+    )
+    stub_relay.fail_status = 409
+    relay_bridge.reset_dropped_traces()
+
+    sink = RelayBridgeSink()
+    sink.on_tool_event(
+        ToolEvent(
+            tool="run_command",
+            title="run_command",
+            args_summary={},
+            result_summary=None,
+            started_at="t",
+            duration_ms=1,
+            ok=True,
+        )
+    )
+
+    assert relay_bridge.get_dropped_traces() == 1
+    assert session.get_bound_run() is None
 
 
 def test_sink_connection_refused_does_not_raise_and_increments_dropped() -> None:

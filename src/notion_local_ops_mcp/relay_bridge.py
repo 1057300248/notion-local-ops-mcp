@@ -33,6 +33,11 @@ from .instrument import ToolEvent
 _dropped_lock = threading.Lock()
 dropped_traces: int = 0
 
+# These statuses mean the relay definitively rejected the current binding, not
+# that the relay was temporarily unavailable. Clear the stale process-wide bind
+# so later tools do not keep trying to report into the wrong run.
+STALE_BINDING_HTTP_STATUSES = {400, 401, 404, 409}
+
 
 def get_dropped_traces() -> int:
     """Return the current count of traces dropped due to delivery failure."""
@@ -133,7 +138,11 @@ class RelayBridgeSink:
                 # drop (urlopen raises HTTPError for those, so this branch only
                 # sees 2xx).
                 response.read()
-        except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError, TimeoutError):
+        except urllib.error.HTTPError as exc:
+            if exc.code in STALE_BINDING_HTTP_STATUSES:
+                session.clear_bound_run()
+            _bump_dropped()
+        except (urllib.error.URLError, OSError, ValueError, TimeoutError):
             _bump_dropped()
         except Exception:
             # Defensive: never let a sink failure escape. See instrument.notify_sinks
