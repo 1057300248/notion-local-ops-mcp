@@ -18,6 +18,7 @@ from .config import (
     COMMAND_TIMEOUT,
     DEBUG_MCP_LOGGING,
     DELEGATE_TIMEOUT,
+    FOREGROUND_TIME_BUDGET,
     GRACEFUL_SHUTDOWN_SECONDS,
     HTTP_KEEPALIVE_TIMEOUT,
     HOST,
@@ -32,6 +33,7 @@ from .config import (
     RELAY_URL,
     STATE_DIR,
     STREAM_OUTPUT_INTERVAL,
+    WAIT_TASK_MAX_TIMEOUT,
     WORKSPACE_ROOT,
     ensure_runtime_directories,
 )
@@ -67,7 +69,7 @@ from . import session
 from .pathing import resolve_cwd, resolve_path
 from .search import glob_files as glob_files_impl
 from .search import grep_files as grep_files_impl
-from .shell import run_command as run_command_impl
+from .shell import TIMEOUT_EXIT_CODE, run_command as run_command_impl
 from .skills import list_skills as list_skills_impl
 from .tasks import TaskStore
 
@@ -141,16 +143,21 @@ LOCAL_STATE_TOOL = {
     "openWorldHint": False,
 }
 
+# NOTE: destructiveHint is intentionally False for the write tool groups below.
+# This server runs in a trusted, single-operator setup: the operator reviews the
+# agent's work and keeps git backups before write-heavy sessions, and per-call
+# confirmation prompts in MCP clients (e.g. Notion AI) made agent workflows
+# impractical. Flip these back to True if untrusted clients ever get access.
 LOCAL_WRITE_TOOL = {
     "readOnlyHint": False,
-    "destructiveHint": True,
+    "destructiveHint": False,
     "idempotentHint": False,
     "openWorldHint": False,
 }
 
 OPEN_WORLD_WRITE_TOOL = {
     "readOnlyHint": False,
-    "destructiveHint": True,
+    "destructiveHint": False,
     "idempotentHint": False,
     "openWorldHint": True,
 }
@@ -688,7 +695,12 @@ def git_blame(
     name="run_command",
     title="Run Command",
     annotations=OPEN_WORLD_WRITE_TOOL,
-    description="Run a local shell command now or queue it as a background task for wait_task/get_task polling.",
+    description=(
+        "Run a local shell command. If it does not finish within the foreground "
+        "time budget it is automatically handed off to a background task "
+        "(auto_backgrounded=true); keep polling wait_task/get_task with the "
+        "returned task_id until completed=true."
+    ),
 )
 @traced("run_command", result_fn=_run_command_result_summary)
 def run_command(
@@ -705,11 +717,75 @@ def run_command(
             cwd=resolved_cwd,
             timeout=effective_timeout,
         )
-    return run_command_impl(
+    return _run_foreground_command(command, resolved_cwd, effective_timeout)
+
+
+def _foreground_time_budget() -> int:
+    # Resolved via module globals so tests and runtime overrides are honored.
+    return int(globals().get("FOREGROUND_TIME_BUDGET", 50) or 0)
+
+
+def _run_foreground_command(
+    command: str,
+    resolved_cwd,
+    effective_timeout: int,
+) -> dict[str, object]:
+    """Run a command in the foreground with an automatic background handoff.
+
+    When ``effective_timeout`` exceeds the foreground budget, the command runs
+    through the task registry so that once the budget elapses we can return a
+    task handle instead of blocking until the MCP transport times out.
+    """
+    budget = _foreground_time_budget()
+    if budget <= 0 or effective_timeout <= budget:
+        return run_command_impl(
+            command=command,
+            cwd=resolved_cwd,
+            timeout=effective_timeout,
+        )
+    queued = registry.submit_command(
         command=command,
         cwd=resolved_cwd,
         timeout=effective_timeout,
     )
+    task_id = queued.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        # e.g. the cwd validation error shape from submit_command.
+        return queued
+    meta = registry.wait(task_id, timeout=budget, poll_interval=0.25)
+    if not meta.get("completed"):
+        meta["auto_backgrounded"] = True
+        meta["next"] = (
+            "Command is still running; call wait_task(task_id) or "
+            "get_task(task_id) until completed=true."
+        )
+        return meta
+    # Completed within the budget: return the classic run_command shape with
+    # full stdout/stderr read back from the task logs.
+    meta = registry.get(task_id)
+    status = meta.get("status")
+    exit_code = meta.get("exit_code")
+    command_timed_out = bool(meta.get("timed_out")) and status == "failed"
+    result: dict[str, object] = {
+        "success": status == "succeeded",
+        "command": command,
+        "cwd": str(resolved_cwd),
+        "exit_code": exit_code if isinstance(exit_code, int) else TIMEOUT_EXIT_CODE,
+        "stdout": store.read_stdout(task_id),
+        "stderr": store.read_stderr(task_id),
+        "timed_out": command_timed_out,
+        "task_id": task_id,
+    }
+    if command_timed_out:
+        result["timeout"] = effective_timeout
+        result["error"] = {
+            "code": "timed_out",
+            "message": (
+                f"Command exceeded the {effective_timeout}s timeout and was "
+                "terminated. Retry with a larger `timeout` argument."
+            ),
+        }
+    return result
 
 
 @mcp.tool(
@@ -795,11 +871,36 @@ def get_task(task_id: str) -> dict[str, object]:
     name="wait_task",
     title="Wait Task",
     annotations=READ_ONLY_TOOL,
-    description="Wait for a delegated or background shell task to finish or until timeout, then return its latest status and output tail.",
+    description=(
+        "Wait for a delegated or background shell task to finish or until timeout, "
+        "then return its latest status and output tail. The timeout is clamped "
+        "server-side (default 25s) to stay under MCP transport limits; call "
+        "repeatedly until completed=true."
+    ),
 )
 @traced("wait_task", result_fn=_task_result_summary)
 def wait_task(task_id: str, timeout: float = 30, poll_interval: float = 0.5) -> dict[str, object]:
-    return registry.wait(task_id, timeout=timeout, poll_interval=poll_interval)
+    return _wait_task_clamped(task_id, timeout=timeout, poll_interval=poll_interval)
+
+
+def _max_wait_task_timeout() -> float:
+    # Resolved via module globals so tests and runtime overrides are honored.
+    return float(globals().get("WAIT_TASK_MAX_TIMEOUT", 25.0) or 25.0)
+
+
+def _wait_task_clamped(
+    task_id: str,
+    *,
+    timeout: float,
+    poll_interval: float,
+) -> dict[str, object]:
+    max_wait = _max_wait_task_timeout()
+    effective = min(max(float(timeout), 0.0), max_wait)
+    meta = registry.wait(task_id, timeout=effective, poll_interval=poll_interval)
+    if not meta.get("completed") and effective < float(timeout):
+        meta["wait_timeout_clamped_to"] = effective
+        meta["next"] = "call wait_task again until completed=true"
+    return meta
 
 
 @mcp.tool(

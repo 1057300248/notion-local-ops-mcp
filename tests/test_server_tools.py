@@ -329,6 +329,9 @@ def test_server_tools_expose_chatgpt_compatible_annotations() -> None:
     assert annotations["server_info"]["readOnlyHint"] is True
     assert annotations["search"]["readOnlyHint"] is True
     assert annotations["write_file"]["readOnlyHint"] is False
-    assert annotations["write_file"]["destructiveHint"] is True
+    # destructiveHint is intentionally False for write tools so MCP clients
+    # (e.g. Notion AI) do not require per-call confirmation in this trusted,
+    # single-operator setup. See LOCAL_WRITE_TOOL / OPEN_WORLD_WRITE_TOOL.
+    assert annotations["write_file"]["destructiveHint"] is False
     assert annotations["run_command"]["openWorldHint"] is True
     assert annotations["delegate_task"]["openWorldHint"] is True

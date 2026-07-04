@@ -115,6 +115,13 @@ CODEX_COMMAND = os.environ.get("NOTION_LOCAL_OPS_CODEX_COMMAND", "codex").strip(
 CLAUDE_COMMAND = os.environ.get("NOTION_LOCAL_OPS_CLAUDE_COMMAND", "claude").strip()
 COMMAND_TIMEOUT = _env_int("NOTION_LOCAL_OPS_COMMAND_TIMEOUT", 120, min_value=1)
 DELEGATE_TIMEOUT = _env_int("NOTION_LOCAL_OPS_DELEGATE_TIMEOUT", 1800, min_value=1)
+# Wall-time budget (seconds) run_command may spend in the foreground before the
+# still-running command is handed off to background task polling. Keep this
+# below the MCP client transport timeout (~60s). Set 0 to disable the handoff.
+FOREGROUND_TIME_BUDGET = _env_int("NOTION_LOCAL_OPS_FOREGROUND_TIME_BUDGET", 50, min_value=0)
+# Server-side cap (seconds) for wait_task's timeout argument, for the same
+# reason: longer waits would exceed the MCP transport timeout and error out.
+WAIT_TASK_MAX_TIMEOUT = _env_float("NOTION_LOCAL_OPS_WAIT_TASK_MAX_TIMEOUT", 25.0, min_value=1.0)
 DEBUG_MCP_LOGGING = _env_flag("NOTION_LOCAL_OPS_DEBUG_MCP_LOGGING", default=False)
 GRACEFUL_SHUTDOWN_SECONDS = _env_int(
     "NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS",
