@@ -26,6 +26,10 @@ from .config import (
     OAUTH_TOKEN_TTL_SECONDS,
     PORT,
     PUBLIC_BASE_URL,
+    RELAY_BRIDGE_ENABLED,
+    RELAY_BINDING_TTL_SECONDS,
+    RELAY_BRIDGE_TIMEOUT,
+    RELAY_URL,
     STATE_DIR,
     STREAM_OUTPUT_INTERVAL,
     WORKSPACE_ROOT,
@@ -42,8 +46,23 @@ from .gitops import git_diff as git_diff_impl
 from .gitops import git_log as git_log_impl
 from .gitops import git_show as git_show_impl
 from .gitops import git_status as git_status_impl
+from .instrument import (
+    _git_commit_result_summary,
+    _patch_args_summary,
+    _patch_result_summary,
+    _purge_result_summary,
+    _read_result_summary,
+    _run_command_result_summary,
+    _server_info_result_summary,
+    _task_result_summary,
+    _write_file_result_summary,
+    register_sink,
+    traced,
+)
 from .oauth import OAuthRuntimeConfig
 from .patching import apply_patch as apply_patch_impl
+from . import relay_bridge
+from .relay_bridge import RelayBridgeSink
 from . import session
 from .pathing import resolve_cwd, resolve_path
 from .search import glob_files as glob_files_impl
@@ -100,6 +119,14 @@ def _current_debug_mcp_logging() -> bool:
     return bool(globals().get("DEBUG_MCP_LOGGING", False))
 
 
+# Register the relay bridge sink at import time. The sink is a no-op unless a
+# relay run is bound (session.set_bound_run), so registering it unconditionally
+# (when enabled) does not change behavior for non-bridged clients. Re-registration
+# is guarded inside register_sink, so repeated imports of this module are safe.
+if RELAY_BRIDGE_ENABLED:
+    register_sink(RelayBridgeSink())
+
+
 READ_ONLY_TOOL = {
     "readOnlyHint": True,
     "destructiveHint": False,
@@ -141,6 +168,7 @@ OPEN_WORLD_WRITE_TOOL = {
         "description_max_length to cap long descriptions for index-style scans."
     ),
 )
+@traced("list_skills", result_fn=_read_result_summary)
 def list_skills(
     include_project: bool = True,
     include_global: bool = True,
@@ -170,6 +198,7 @@ def list_skills(
         "fnmatch-style patterns (matched against both name and relative path)."
     ),
 )
+@traced("list_files", result_fn=_read_result_summary)
 def list_files(
     path: str | None = None,
     recursive: bool = False,
@@ -202,6 +231,7 @@ def list_files(
         "paths are excluded by default; regex/text search also accept a single file path."
     ),
 )
+@traced("search", result_fn=_read_result_summary)
 def search(
     mode: str = "regex",
     path: str | None = None,
@@ -298,6 +328,7 @@ def search(
         "Set include_line_numbers=true when evidence or code-review output needs numbered lines."
     ),
 )
+@traced("read_text", result_fn=_read_result_summary)
 def read_text(
     path: str | None = None,
     paths: list[str] | None = None,
@@ -352,6 +383,7 @@ def read_text(
     annotations=LOCAL_WRITE_TOOL,
     description="Write full content to a file (supports dry_run preview without touching disk).",
 )
+@traced("write_file", result_fn=_write_file_result_summary)
 def write_file(path: str, content: str, dry_run: bool = False) -> dict[str, object]:
     target = resolve_path(path, WORKSPACE_ROOT)
     return write_file_impl(target, content=content, dry_run=dry_run)
@@ -366,6 +398,11 @@ def write_file(path: str, content: str, dry_run: bool = False) -> dict[str, obje
         "Each @@ hunk must contain at least one '+' or '-' line and must "
         "match exactly one location in the target file; pure-context hunks are rejected."
     ),
+)
+@traced(
+    "apply_patch",
+    args_fn=_patch_args_summary,
+    result_fn=_patch_result_summary,
 )
 def apply_patch(
     patch: str,
@@ -392,6 +429,7 @@ def apply_patch(
         "call to confirm which bridge you are connected to and what it can do."
     ),
 )
+@traced("server_info", result_fn=_server_info_result_summary)
 async def server_info() -> dict[str, object]:
     list_tools = getattr(mcp, "_list_tools")
     try:
@@ -401,6 +439,7 @@ async def server_info() -> dict[str, object]:
         registered = await list_tools(None)
     tools = sorted(tool.name for tool in registered)
     session_cwd = session.get_default_cwd()
+    binding = session.get_bound_run()
     return {
         "success": True,
         "app_name": APP_NAME,
@@ -417,6 +456,18 @@ async def server_info() -> dict[str, object]:
         "debug_mcp_logging": bool(DEBUG_MCP_LOGGING),
         "codex_command": CODEX_COMMAND,
         "claude_command": CLAUDE_COMMAND,
+        "relay_bridge": {
+            "enabled": bool(RELAY_BRIDGE_ENABLED),
+            "timeout_seconds": float(RELAY_BRIDGE_TIMEOUT),
+            "binding_ttl_seconds": float(RELAY_BINDING_TTL_SECONDS),
+            "default_relay_url": RELAY_URL,
+            "bound": binding is not None,
+            "request_id": binding.get("request_id") if binding else None,
+            "conversation_key": binding.get("conversation_key") if binding else None,
+            "relay_url": binding.get("relay_url") if binding else None,
+            "bound_at": binding.get("bound_at") if binding else None,
+            "dropped_traces": relay_bridge.get_dropped_traces(),
+        },
         "tools": tools,
         "tool_count": len(tools),
     }
@@ -433,6 +484,7 @@ async def server_info() -> dict[str, object]:
         "repo: set it once instead of passing `cwd` on every call."
     ),
 )
+@traced("set_default_cwd")
 def set_default_cwd(path: str | None = None) -> dict[str, object]:
     if not path:
         session.set_default_cwd(None)
@@ -479,6 +531,7 @@ def set_default_cwd(path: str | None = None) -> dict[str, object]:
         "from the session override (set_default_cwd) or from the server's workspace root."
     ),
 )
+@traced("get_default_cwd")
 def get_default_cwd() -> dict[str, object]:
     session_cwd = session.get_default_cwd()
     effective = session_cwd if session_cwd is not None else WORKSPACE_ROOT
@@ -497,6 +550,7 @@ def get_default_cwd() -> dict[str, object]:
     annotations=READ_ONLY_TOOL,
     description="Return structured git status for the repository at cwd or the current workspace root.",
 )
+@traced("git_status", result_fn=_read_result_summary)
 def git_status(cwd: str | None = None) -> dict[str, object]:
     resolved_cwd = resolve_cwd(cwd, WORKSPACE_ROOT)
     return git_status_impl(cwd=resolved_cwd)
@@ -512,6 +566,7 @@ def git_status(cwd: str | None = None) -> dict[str, object]:
         "file does not hide changes in other files."
     ),
 )
+@traced("git_diff", result_fn=_read_result_summary)
 def git_diff(
     cwd: str | None = None,
     staged: bool = False,
@@ -539,6 +594,7 @@ def git_diff(
         "sign_off (append Signed-off-by trailer), and dry_run preview."
     ),
 )
+@traced("git_commit", result_fn=_git_commit_result_summary)
 def git_commit(
     message: str,
     cwd: str | None = None,
@@ -570,6 +626,7 @@ def git_commit(
     annotations=READ_ONLY_TOOL,
     description="Return recent git commits for the repository at cwd.",
 )
+@traced("git_log", result_fn=_read_result_summary)
 def git_log(cwd: str | None = None, limit: int = 10) -> dict[str, object]:
     resolved_cwd = resolve_cwd(cwd, WORKSPACE_ROOT)
     return git_log_impl(cwd=resolved_cwd, limit=limit)
@@ -584,6 +641,7 @@ def git_log(cwd: str | None = None, limit: int = 10) -> dict[str, object]:
         "Useful for inspecting a specific commit without shelling out."
     ),
 )
+@traced("git_show", result_fn=_read_result_summary)
 def git_show(
     ref: str = "HEAD",
     cwd: str | None = None,
@@ -608,6 +666,7 @@ def git_show(
         "Restrict to a line range via start_line / end_line."
     ),
 )
+@traced("git_blame", result_fn=_read_result_summary)
 def git_blame(
     path: str,
     cwd: str | None = None,
@@ -631,6 +690,7 @@ def git_blame(
     annotations=OPEN_WORLD_WRITE_TOOL,
     description="Run a local shell command now or queue it as a background task for wait_task/get_task polling.",
 )
+@traced("run_command", result_fn=_run_command_result_summary)
 def run_command(
     command: str,
     cwd: str | None = None,
@@ -661,6 +721,7 @@ def run_command(
         "stream-like polling via get_task/wait_task."
     ),
 )
+@traced("run_command_stream", result_fn=_task_result_summary)
 def run_command_stream(
     command: str,
     cwd: str | None = None,
@@ -689,6 +750,7 @@ def run_command_stream(
         "capture JSON output as structured_output."
     ),
 )
+@traced("delegate_task", result_fn=_task_result_summary)
 def delegate_task(
     task: str | None = None,
     goal: str | None = None,
@@ -724,6 +786,7 @@ def delegate_task(
     annotations=READ_ONLY_TOOL,
     description="Get the current status and output tail for a delegated or background shell task.",
 )
+@traced("get_task", result_fn=_task_result_summary)
 def get_task(task_id: str) -> dict[str, object]:
     return registry.get(task_id)
 
@@ -734,6 +797,7 @@ def get_task(task_id: str) -> dict[str, object]:
     annotations=READ_ONLY_TOOL,
     description="Wait for a delegated or background shell task to finish or until timeout, then return its latest status and output tail.",
 )
+@traced("wait_task", result_fn=_task_result_summary)
 def wait_task(task_id: str, timeout: float = 30, poll_interval: float = 0.5) -> dict[str, object]:
     return registry.wait(task_id, timeout=timeout, poll_interval=poll_interval)
 
@@ -744,6 +808,7 @@ def wait_task(task_id: str, timeout: float = 30, poll_interval: float = 0.5) -> 
     annotations=LOCAL_WRITE_TOOL,
     description="Cancel a delegated or background shell task if it is still running.",
 )
+@traced("cancel_task", result_fn=_task_result_summary)
 def cancel_task(task_id: str) -> dict[str, object]:
     return registry.cancel(task_id)
 
@@ -757,11 +822,93 @@ def cancel_task(task_id: str) -> dict[str, object]:
         "Defaults to 7 days; supports dry_run preview."
     ),
 )
+@traced("purge_tasks", result_fn=_purge_result_summary)
 def purge_tasks(older_than_hours: float = 24 * 7, dry_run: bool = False) -> dict[str, object]:
     return store.purge_tasks(
         older_than_seconds=max(float(older_than_hours), 0.0) * 3600.0,
         dry_run=dry_run,
     )
+
+
+@mcp.tool(
+    name="bind_relay_run",
+    title="Bind Relay Run",
+    annotations=LOCAL_STATE_TOOL,
+    description=(
+        "Use this once after a relay trigger to mirror your tool calls to the local "
+        "operator. Pass only the request_id and callback_token from the relay trigger "
+        "(conversation_key too if available). The relay address is already configured "
+        "locally, so you do not need to pass it. After this, every tool you call here "
+        "is automatically reported to the relay so the operator can follow your work in "
+        "real time. Pass null/empty for request_id (or call clear_relay_run) to unbind. "
+        "No-op if you're not working with a relay. Binding is process-wide and "
+        "single-valued; a new bind overwrites the previous one. The relay being "
+        "unreachable never blocks tool execution."
+    ),
+)
+def bind_relay_run(
+    request_id: str | None = None,
+    callback_token: str | None = None,
+    relay_url: str | None = None,
+    conversation_key: str | None = None,
+) -> dict[str, object]:
+    # Treat an empty/whitespace request_id as an explicit unbind so agents that
+    # "pass null to unbind" work without needing a separate tool.
+    if not request_id or not request_id.strip():
+        session.clear_bound_run()
+        return {
+            "success": True,
+            "bound": False,
+            "request_id": None,
+            "relay_url": None,
+        }
+    if not callback_token:
+        return {
+            "success": False,
+            "error": {
+                "code": "missing_callback_token",
+                "message": "bind_relay_run requires a callback_token when request_id is set.",
+            },
+        }
+    # relay_url is optional: fall back to the locally configured default so the
+    # agent never has to know the relay host/port.
+    resolved_relay_url = (relay_url.strip() if isinstance(relay_url, str) and relay_url.strip() else RELAY_URL)
+    active = session.set_bound_run(
+        {
+            "request_id": request_id,
+            "callback_token": callback_token,
+            "relay_url": resolved_relay_url,
+            "conversation_key": conversation_key,
+        }
+    )
+    return {
+        "success": True,
+        "bound": True,
+        "request_id": active.get("request_id") if active else request_id,
+        "relay_url": active.get("relay_url") if active else resolved_relay_url,
+        "conversation_key": active.get("conversation_key") if active else conversation_key,
+        "bound_at": active.get("bound_at") if active else None,
+    }
+
+
+@mcp.tool(
+    name="clear_relay_run",
+    title="Clear Relay Run",
+    annotations=LOCAL_STATE_TOOL,
+    description=(
+        "Unbind the relay run so subsequent tool calls are no longer mirrored to a "
+        "relay. Equivalent to calling bind_relay_run with a null request_id. Safe to "
+        "call even when nothing is bound."
+    ),
+)
+def clear_relay_run() -> dict[str, object]:
+    session.clear_bound_run()
+    return {
+        "success": True,
+        "bound": False,
+        "request_id": None,
+        "relay_url": None,
+    }
 
 
 def build_http_app():

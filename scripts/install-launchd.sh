@@ -30,11 +30,15 @@ fi
 CLOUDFLARED_BIN="$(command -v cloudflared)"
 MCP_LABEL="$(mcp_label)"
 CLOUDFLARED_LABEL="$(cloudflared_label)"
+WATCHDOG_LABEL="$(watchdog_label)"
 MCP_TARGET="$(launchctl_target "${MCP_LABEL}")"
 CLOUDFLARED_TARGET="$(launchctl_target "${CLOUDFLARED_LABEL}")"
+WATCHDOG_TARGET="$(launchctl_target "${WATCHDOG_LABEL}")"
 MCP_PLIST="$(plist_path_for_label "${MCP_LABEL}")"
 CLOUDFLARED_PLIST="$(plist_path_for_label "${CLOUDFLARED_LABEL}")"
+WATCHDOG_PLIST="$(plist_path_for_label "${WATCHDOG_LABEL}")"
 
+launchctl bootout "${WATCHDOG_TARGET}" 2>/dev/null || true
 launchctl bootout "${MCP_TARGET}" 2>/dev/null || true
 launchctl bootout "${CLOUDFLARED_TARGET}" 2>/dev/null || true
 sleep 1
@@ -45,7 +49,7 @@ if lsof -nP -iTCP:"${NOTION_LOCAL_OPS_PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
 fi
 
 mkdir -p "${NOTION_LOCAL_OPS_LAUNCHD_DIR}" "${NOTION_LOCAL_OPS_LAUNCHD_LOG_DIR}" "${NOTION_LOCAL_OPS_STATE_DIR}"
-export ROOT_DIR CLOUDFLARED_BIN CLOUDFLARED_CONFIG MCP_PLIST CLOUDFLARED_PLIST
+export ROOT_DIR CLOUDFLARED_BIN CLOUDFLARED_CONFIG MCP_PLIST CLOUDFLARED_PLIST WATCHDOG_PLIST
 python - <<'PY'
 import os
 from pathlib import Path
@@ -54,6 +58,7 @@ from notion_local_ops_mcp.launchd_support import (
     LaunchdServiceConfig,
     build_cloudflared_launch_agent,
     build_mcp_launch_agent,
+    build_watchdog_launch_agent,
     write_launch_agent,
 )
 
@@ -87,6 +92,14 @@ config = LaunchdServiceConfig(
             "NOTION_LOCAL_OPS_DELEGATE_TIMEOUT",
             "NOTION_LOCAL_OPS_DEBUG_MCP_LOGGING",
             "NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS",
+            "NOTION_LOCAL_OPS_WATCHDOG_INTERVAL_SECONDS",
+            "NOTION_LOCAL_OPS_DOCTOR_FAILURE_THRESHOLD",
+            "NOTION_LOCAL_OPS_DOCTOR_BASE_BACKOFF_SECONDS",
+            "NOTION_LOCAL_OPS_DOCTOR_MAX_BACKOFF_SECONDS",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
         }
     },
 )
@@ -103,6 +116,13 @@ config = LaunchdServiceConfig(
 )
 write_launch_agent(Path(os.environ["MCP_PLIST"]), build_mcp_launch_agent(config))
 write_launch_agent(Path(os.environ["CLOUDFLARED_PLIST"]), build_cloudflared_launch_agent(config))
+write_launch_agent(
+    Path(os.environ["WATCHDOG_PLIST"]),
+    build_watchdog_launch_agent(
+        config,
+        interval_seconds=int(os.environ["NOTION_LOCAL_OPS_WATCHDOG_INTERVAL_SECONDS"]),
+    ),
+)
 PY
 
 launchctl bootstrap "gui/${UID}" "${MCP_PLIST}"
@@ -116,12 +136,16 @@ if ! curl -fsSI "http://${NOTION_LOCAL_OPS_HOST}:${NOTION_LOCAL_OPS_PORT}/mcp" >
   echo "Launchd services installed, but local /mcp is not reachable yet. Check launchctl print ${MCP_TARGET} and logs under ${NOTION_LOCAL_OPS_LAUNCHD_LOG_DIR}." >&2
   exit 1
 fi
+launchctl bootstrap "gui/${UID}" "${WATCHDOG_PLIST}"
+launchctl kickstart -k "${WATCHDOG_TARGET}" || true
 
 echo "Installed launchd services:"
 echo "- MCP:         ${MCP_TARGET}"
 echo "- cloudflared: ${CLOUDFLARED_TARGET}"
+echo "- watchdog:    ${WATCHDOG_TARGET} (every ${NOTION_LOCAL_OPS_WATCHDOG_INTERVAL_SECONDS}s)"
 echo "Plists:"
 echo "- ${MCP_PLIST}"
 echo "- ${CLOUDFLARED_PLIST}"
+echo "- ${WATCHDOG_PLIST}"
 echo "Logs: ${NOTION_LOCAL_OPS_LAUNCHD_LOG_DIR}"
-echo "Use ./scripts/launchd-status.sh to inspect, ./scripts/launchd-reload.sh for code reload, and ./scripts/launchd-restart.sh all for full restarts."
+echo "Use ./scripts/launchd-status.sh to inspect, ./scripts/launchd-doctor.sh --fix for one-shot repair, ./scripts/launchd-reload.sh for code reload, and ./scripts/launchd-restart.sh all for full restarts."

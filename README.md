@@ -172,6 +172,29 @@ Output style:
 
 </details>
 
+## Relay Bridge (mirror tool calls to a dashboard)
+
+When paired with [workspace-agent-relay-mcp](https://github.com/catoncat/workspace-agent-relay-mcp), every tool call an agent makes here can be auto-mirrored to that relay's live dashboard — so a local operator watches the agent work without it manually reporting anything.
+
+How it works:
+
+1. The agent calls `bind_relay_run` here with the `request_id` + `callback_token` from a relay trigger (no relay URL needed — it's configured locally).
+2. Every `@traced` tool call thereafter fires a fire-and-forget `POST /internal/tool-trace` to the relay.
+3. The relay stores it and pushes it to the dashboard over SSE.
+
+It's a **generic instrumentation layer** (`@traced` decorator + pluggable sinks), so the relay is just one sink — not hardcoded. The relay being unreachable never blocks tool execution; traces are best-effort.
+
+Env knobs:
+
+```bash
+NOTION_LOCAL_OPS_RELAY_BRIDGE_ENABLED=true     # default true; set false to disable entirely
+NOTION_LOCAL_OPS_RELAY_URL=http://127.0.0.1:8799  # default relay endpoint used by bind_relay_run
+NOTION_LOCAL_OPS_RELAY_BRIDGE_TIMEOUT=1.5       # seconds, caps the trace POST
+NOTION_LOCAL_OPS_RELAY_BINDING_TTL_SECONDS=3600 # seconds, clears old bindings before posting traces
+```
+
+`bind_relay_run` / `clear_relay_run` are the agent-facing controls; `server_info` exposes `relay_bridge` state (enabled, bound, dropped_traces, …). Disabled or unbound => zero behavior change.
+
 ## Optional Use Case
 
 If you also want the **Notion AI instruction page + project-management** workflow, see:
@@ -317,12 +340,21 @@ What gets installed:
 
 - one LaunchAgent for the local MCP supervisor
 - one LaunchAgent for `cloudflared tunnel run`
+- one timer-style LaunchAgent that runs `launchd-doctor.sh --fix` every
+  `NOTION_LOCAL_OPS_WATCHDOG_INTERVAL_SECONDS` seconds
 - automatic restart via `launchd` `KeepAlive` when either process exits
+- health-based restart when local `/mcp` or public `/mcp` stays unreachable
+  for `NOTION_LOCAL_OPS_DOCTOR_FAILURE_THRESHOLD` checks
+- exponential restart backoff starting at
+  `NOTION_LOCAL_OPS_DOCTOR_BASE_BACKOFF_SECONDS` and capped by
+  `NOTION_LOCAL_OPS_DOCTOR_MAX_BACKOFF_SECONDS`
 
 Useful commands after install:
 
 ```bash
 ./scripts/launchd-status.sh
+./scripts/launchd-doctor.sh          # diagnose local vs public /mcp
+./scripts/launchd-doctor.sh --fix    # restart only the failed layer
 ./scripts/launchd-reload.sh           # code-only rolling reload via HUP
 ./scripts/launchd-restart.sh mcp      # full MCP restart after dependency/env changes
 ./scripts/launchd-restart.sh all      # restart MCP + cloudflared
@@ -336,6 +368,12 @@ Update workflow:
   the rendered plist or dependency constraints may be stale, otherwise use
   `./scripts/launchd-restart.sh mcp`
 - tunnel config changes: `./scripts/launchd-restart.sh cloudflared`
+- watchdog interval changes: set `NOTION_LOCAL_OPS_WATCHDOG_INTERVAL_SECONDS`
+  and rerun `./scripts/install-launchd.sh`
+- doctor/backoff changes: set `NOTION_LOCAL_OPS_DOCTOR_FAILURE_THRESHOLD`,
+  `NOTION_LOCAL_OPS_DOCTOR_BASE_BACKOFF_SECONDS`, or
+  `NOTION_LOCAL_OPS_DOCTOR_MAX_BACKOFF_SECONDS`, then rerun
+  `./scripts/install-launchd.sh`
 
 ### Windows Optional Multi-Instance Launcher
 
@@ -427,6 +465,11 @@ cloudflared tunnel --config ./cloudflared-example.yml run <your-tunnel-name>
 - `wait_task`: block until a delegated or background shell task completes or times out
 - `cancel_task`: stop a delegated or background shell task
 - `purge_tasks`: clean old task artifacts from `STATE_DIR/tasks` with dry-run support
+
+Relay bridge controls (see [Relay Bridge](#relay-bridge-mirror-tool-calls-to-a-dashboard)):
+
+- `bind_relay_run`: bind the current process to a relay run so subsequent tool calls are mirrored
+- `clear_relay_run`: unbind; equivalent to `bind_relay_run` with a null `request_id`
 
 ## Debugging Notion / MCP handshake issues
 

@@ -15,12 +15,16 @@ case "${TARGET_KIND}" in
   cloudflared)
     launchctl kickstart -k "$(launchctl_target "$(cloudflared_label)")"
     ;;
+  watchdog)
+    launchctl kickstart -k "$(launchctl_target "$(watchdog_label)")"
+    ;;
   all)
     launchctl kickstart -k "$(launchctl_target "$(mcp_label)")"
     launchctl kickstart -k "$(launchctl_target "$(cloudflared_label)")"
+    launchctl kickstart -k "$(launchctl_target "$(watchdog_label)")"
     ;;
   *)
-    echo "Usage: ./scripts/launchd-restart.sh [mcp|cloudflared|all]" >&2
+    echo "Usage: ./scripts/launchd-restart.sh [mcp|cloudflared|watchdog|all]" >&2
     exit 1
     ;;
 esac

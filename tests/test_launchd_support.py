@@ -8,8 +8,10 @@ from notion_local_ops_mcp.launchd_support import (
     LaunchdServiceConfig,
     build_cloudflared_launch_agent,
     build_mcp_launch_agent,
+    build_watchdog_launch_agent,
     mcp_service_label,
     cloudflared_service_label,
+    watchdog_service_label,
     plist_path,
     write_launch_agent,
 )
@@ -95,12 +97,93 @@ def test_build_cloudflared_launch_agent_uses_named_tunnel_when_present(tmp_path:
     assert payload["StandardErrorPath"] == str(config.logs_dir / "cloudflared.stderr.log")
 
 
+def test_build_cloudflared_launch_agent_preserves_proxy_env(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config = LaunchdServiceConfig(
+        repo_root=config.repo_root,
+        launch_agents_dir=config.launch_agents_dir,
+        logs_dir=config.logs_dir,
+        label_prefix=config.label_prefix,
+        python_bin=config.python_bin,
+        cloudflared_bin=config.cloudflared_bin,
+        cloudflared_config=config.cloudflared_config,
+        tunnel_name=config.tunnel_name,
+        env={
+            **config.env,
+            "HTTPS_PROXY": "http://127.0.0.1:7890",
+            "HTTP_PROXY": "http://127.0.0.1:7890",
+            "ALL_PROXY": "http://127.0.0.1:7890",
+            "NO_PROXY": "127.0.0.1,localhost",
+        },
+    )
+
+    payload = build_cloudflared_launch_agent(config)
+
+    assert payload["EnvironmentVariables"] == {
+        "PATH": "/opt/homebrew/bin:/usr/bin:/bin",
+        "HTTP_PROXY": "http://127.0.0.1:7890",
+        "HTTPS_PROXY": "http://127.0.0.1:7890",
+        "ALL_PROXY": "http://127.0.0.1:7890",
+        "NO_PROXY": "127.0.0.1,localhost",
+    }
+
+
+def test_build_watchdog_launch_agent_runs_doctor_on_interval(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config = LaunchdServiceConfig(
+        repo_root=config.repo_root,
+        launch_agents_dir=config.launch_agents_dir,
+        logs_dir=config.logs_dir,
+        label_prefix=config.label_prefix,
+        python_bin=config.python_bin,
+        cloudflared_bin=config.cloudflared_bin,
+        cloudflared_config=config.cloudflared_config,
+        tunnel_name=config.tunnel_name,
+        env={
+            **config.env,
+            "HTTPS_PROXY": "http://127.0.0.1:7890",
+            "NO_PROXY": "127.0.0.1,localhost",
+            "NOTION_LOCAL_OPS_DOCTOR_FAILURE_THRESHOLD": "3",
+            "NOTION_LOCAL_OPS_DOCTOR_BASE_BACKOFF_SECONDS": "300",
+            "NOTION_LOCAL_OPS_DOCTOR_MAX_BACKOFF_SECONDS": "3600",
+        },
+    )
+
+    payload = build_watchdog_launch_agent(config, interval_seconds=45)
+
+    assert payload["Label"] == "com.example.notion-local-ops.watchdog"
+    assert payload["RunAtLoad"] is True
+    assert "KeepAlive" not in payload
+    assert payload["StartInterval"] == 45
+    assert payload["ProgramArguments"] == [
+        "/bin/bash",
+        str(config.repo_root / "scripts" / "launchd-doctor.sh"),
+        "--fix",
+        "--quiet",
+    ]
+    assert payload["EnvironmentVariables"] == {
+        "PATH": "/opt/homebrew/bin:/usr/bin:/bin",
+        "NOTION_LOCAL_OPS_HOST": "127.0.0.1",
+        "NOTION_LOCAL_OPS_PORT": "8766",
+        "NOTION_LOCAL_OPS_STATE_DIR": "/tmp/state",
+        "NOTION_LOCAL_OPS_LAUNCHD_LABEL_PREFIX": "com.example.notion-local-ops",
+        "NOTION_LOCAL_OPS_LAUNCHD_DIR": str(config.launch_agents_dir),
+        "NOTION_LOCAL_OPS_LAUNCHD_LOG_DIR": str(config.logs_dir),
+        "NOTION_LOCAL_OPS_DOCTOR_FAILURE_THRESHOLD": "3",
+        "NOTION_LOCAL_OPS_DOCTOR_BASE_BACKOFF_SECONDS": "300",
+        "NOTION_LOCAL_OPS_DOCTOR_MAX_BACKOFF_SECONDS": "3600",
+    }
+    assert payload["StandardOutPath"] == str(config.logs_dir / "watchdog.stdout.log")
+    assert payload["StandardErrorPath"] == str(config.logs_dir / "watchdog.stderr.log")
+
+
 def test_launchd_label_helpers_and_plist_path(tmp_path: Path) -> None:
     launch_agents_dir = tmp_path / "LaunchAgents"
     prefix = "com.example.notion-local-ops"
 
     assert mcp_service_label(prefix) == "com.example.notion-local-ops.mcp"
     assert cloudflared_service_label(prefix) == "com.example.notion-local-ops.cloudflared"
+    assert watchdog_service_label(prefix) == "com.example.notion-local-ops.watchdog"
     assert plist_path(launch_agents_dir, mcp_service_label(prefix)) == (
         launch_agents_dir / "com.example.notion-local-ops.mcp.plist"
     )

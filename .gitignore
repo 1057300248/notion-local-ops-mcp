@@ -16,3 +16,9 @@ __pycache__/
 tools/
 Start-Notion-Local-MCP.cmd
 启动 Notion Local MCP.cmd
+
+# Editor / tool private state
+.commandcode/
+.cursor/
+.idea/
+.vscode/

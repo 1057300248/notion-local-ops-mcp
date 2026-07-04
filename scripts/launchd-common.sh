@@ -144,6 +144,10 @@ prepare_launchd_env() {
   local override_delegate_timeout="${NOTION_LOCAL_OPS_DELEGATE_TIMEOUT:-}"
   local override_debug_mcp_logging="${NOTION_LOCAL_OPS_DEBUG_MCP_LOGGING:-}"
   local override_graceful_shutdown_seconds="${NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS:-}"
+  local override_watchdog_interval_seconds="${NOTION_LOCAL_OPS_WATCHDOG_INTERVAL_SECONDS:-}"
+  local override_doctor_failure_threshold="${NOTION_LOCAL_OPS_DOCTOR_FAILURE_THRESHOLD:-}"
+  local override_doctor_base_backoff_seconds="${NOTION_LOCAL_OPS_DOCTOR_BASE_BACKOFF_SECONDS:-}"
+  local override_doctor_max_backoff_seconds="${NOTION_LOCAL_OPS_DOCTOR_MAX_BACKOFF_SECONDS:-}"
   local override_label_prefix="${NOTION_LOCAL_OPS_LAUNCHD_LABEL_PREFIX:-}"
   local override_launchd_dir="${NOTION_LOCAL_OPS_LAUNCHD_DIR:-}"
   local override_launchd_log_dir="${NOTION_LOCAL_OPS_LAUNCHD_LOG_DIR:-}"
@@ -163,6 +167,10 @@ prepare_launchd_env() {
   export NOTION_LOCAL_OPS_DELEGATE_TIMEOUT="${override_delegate_timeout:-${NOTION_LOCAL_OPS_DELEGATE_TIMEOUT:-1800}}"
   export NOTION_LOCAL_OPS_DEBUG_MCP_LOGGING="${override_debug_mcp_logging:-${NOTION_LOCAL_OPS_DEBUG_MCP_LOGGING:-0}}"
   export NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS="${override_graceful_shutdown_seconds:-${NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS:-30}}"
+  export NOTION_LOCAL_OPS_WATCHDOG_INTERVAL_SECONDS="${override_watchdog_interval_seconds:-${NOTION_LOCAL_OPS_WATCHDOG_INTERVAL_SECONDS:-60}}"
+  export NOTION_LOCAL_OPS_DOCTOR_FAILURE_THRESHOLD="${override_doctor_failure_threshold:-${NOTION_LOCAL_OPS_DOCTOR_FAILURE_THRESHOLD:-3}}"
+  export NOTION_LOCAL_OPS_DOCTOR_BASE_BACKOFF_SECONDS="${override_doctor_base_backoff_seconds:-${NOTION_LOCAL_OPS_DOCTOR_BASE_BACKOFF_SECONDS:-300}}"
+  export NOTION_LOCAL_OPS_DOCTOR_MAX_BACKOFF_SECONDS="${override_doctor_max_backoff_seconds:-${NOTION_LOCAL_OPS_DOCTOR_MAX_BACKOFF_SECONDS:-3600}}"
   export NOTION_LOCAL_OPS_LAUNCHD_LABEL_PREFIX="${override_label_prefix:-${NOTION_LOCAL_OPS_LAUNCHD_LABEL_PREFIX:-com.notion-local-ops}}"
   export NOTION_LOCAL_OPS_LAUNCHD_DIR="${override_launchd_dir:-${NOTION_LOCAL_OPS_LAUNCHD_DIR:-${HOME}/Library/LaunchAgents}}"
   export NOTION_LOCAL_OPS_LAUNCHD_LOG_DIR="${override_launchd_log_dir:-${NOTION_LOCAL_OPS_LAUNCHD_LOG_DIR:-${HOME}/Library/Logs/notion-local-ops-mcp}}"
@@ -179,6 +187,10 @@ mcp_label() {
 
 cloudflared_label() {
   printf '%s.cloudflared\n' "${NOTION_LOCAL_OPS_LAUNCHD_LABEL_PREFIX}"
+}
+
+watchdog_label() {
+  printf '%s.watchdog\n' "${NOTION_LOCAL_OPS_LAUNCHD_LABEL_PREFIX}"
 }
 
 launchctl_target() {
