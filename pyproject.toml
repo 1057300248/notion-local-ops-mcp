@@ -13,6 +13,12 @@ dependencies = [
     # against pyproject.toml so stale editable metadata cannot silently drift.
     "fastmcp>=3.2.4,<4",
     "uvicorn>=0.30.0",
+    # Direct imports in chrome.py / webtools.py (also a fastmcp transitive dep).
+    "httpx>=0.27.0",
+    # read_image / screenshot / chrome_screenshot compression.
+    "pillow>=10.0.0",
+    # CDP websocket client used by the chrome_* tools.
+    "websockets>=13.0",
 ]
 
 [project.optional-dependencies]

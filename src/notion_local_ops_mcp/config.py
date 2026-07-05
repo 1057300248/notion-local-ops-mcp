@@ -122,6 +122,12 @@ FOREGROUND_TIME_BUDGET = _env_int("NOTION_LOCAL_OPS_FOREGROUND_TIME_BUDGET", 50,
 # Server-side cap (seconds) for wait_task's timeout argument, for the same
 # reason: longer waits would exceed the MCP transport timeout and error out.
 WAIT_TASK_MAX_TIMEOUT = _env_float("NOTION_LOCAL_OPS_WAIT_TASK_MAX_TIMEOUT", 25.0, min_value=1.0)
+# Chrome DevTools Protocol port used by the chrome_* tools. A dedicated
+# automation Chrome instance is launched with --remote-debugging-port on this
+# port when no debugger is reachable (see chrome.ensure_running).
+CHROME_DEBUG_PORT = _env_int("NOTION_LOCAL_OPS_CHROME_DEBUG_PORT", 9222, min_value=1)
+# Optional explicit Chrome/Edge executable path; auto-detected when empty.
+CHROME_BINARY = os.environ.get("NOTION_LOCAL_OPS_CHROME_BINARY", "").strip()
 DEBUG_MCP_LOGGING = _env_flag("NOTION_LOCAL_OPS_DEBUG_MCP_LOGGING", default=False)
 GRACEFUL_SHUTDOWN_SECONDS = _env_int(
     "NOTION_LOCAL_OPS_GRACEFUL_SHUTDOWN_SECONDS",

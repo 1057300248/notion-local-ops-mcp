@@ -5,6 +5,8 @@ import os
 import re
 
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+from fastmcp.utilities.types import Image
 import uvicorn
 
 from .http_compat import build_http_compat_app
@@ -13,6 +15,8 @@ from .config import (
     APP_NAME,
     AUTH_MODE,
     AUTH_TOKEN,
+    CHROME_BINARY,
+    CHROME_DEBUG_PORT,
     CLAUDE_COMMAND,
     CODEX_COMMAND,
     COMMAND_TIMEOUT,
@@ -37,6 +41,7 @@ from .config import (
     WORKSPACE_ROOT,
     ensure_runtime_directories,
 )
+from . import chrome as chrome_impl
 from .executors import ExecutorRegistry
 from .files import list_files as list_files_impl
 from .files import read_file as read_file_impl
@@ -72,6 +77,12 @@ from .search import grep_files as grep_files_impl
 from .shell import TIMEOUT_EXIT_CODE, run_command as run_command_impl
 from .skills import list_skills as list_skills_impl
 from .tasks import TaskStore
+from .imaging import capture_screen as capture_screen_impl
+from .imaging import load_image_file as load_image_file_impl
+from .services import ServiceManager
+from .services import kill_port as kill_port_impl
+from .services import port_status as port_status_impl
+from .webtools import http_request as http_request_impl
 
 
 # Bearer auth lives exclusively in the HTTP layer (http_compat.HTTPBearerAuthMiddleware)
@@ -84,6 +95,7 @@ registry = ExecutorRegistry(
     codex_command=CODEX_COMMAND,
     claude_command=CLAUDE_COMMAND,
 )
+service_manager = ServiceManager(STATE_DIR)
 
 MCP_INSTRUCTIONS = (
     "Use direct tools first for normal tasks. Prioritize apply_patch/write_file for edits and "
@@ -1061,6 +1073,375 @@ class _ReadySignalServer(uvicorn.Server):
             await super().serve(sockets=sockets)
         finally:
             self._close_ready_fd()
+
+
+# ---------------------------------------------------------------------------
+# Image tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool(
+    name="read_image",
+    title="Read Image",
+    annotations=READ_ONLY_TOOL,
+    description=(
+        "Read an image file from disk and return it as viewable image content. "
+        "Images wider than max_width are downscaled and re-encoded "
+        "(format: jpeg | png | webp) so responses stay small."
+    ),
+)
+@traced("read_image")
+def read_image(
+    path: str,
+    max_width: int = 1400,
+    format: str = "jpeg",
+    quality: int = 80,
+) -> Image:
+    target = resolve_path(path, WORKSPACE_ROOT)
+    try:
+        info = load_image_file_impl(
+            target, max_width=max_width, format=format, quality=quality
+        )
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        raise ToolError(str(exc)) from exc
+    except Exception as exc:  # e.g. Pillow cannot decode the file
+        raise ToolError(f"Failed to decode image {target}: {exc}") from exc
+    return Image(data=info["data"], format=info["format"])
+
+
+@mcp.tool(
+    name="screenshot",
+    title="Capture Screen",
+    annotations=READ_ONLY_TOOL,
+    description=(
+        "Capture the local desktop screen and return it as viewable image "
+        "content. monitor='all' captures every display; anything else captures "
+        "only the primary display. Output is downscaled to max_width and "
+        "re-encoded (jpeg | png | webp)."
+    ),
+)
+@traced("screenshot")
+def screenshot(
+    monitor: str = "all",
+    max_width: int = 1600,
+    format: str = "jpeg",
+    quality: int = 80,
+) -> Image:
+    try:
+        shot = capture_screen_impl(
+            monitor=monitor, max_width=max_width, format=format, quality=quality
+        )
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise ToolError(str(exc)) from exc
+    return Image(data=shot["data"], format=shot["format"])
+
+
+# ---------------------------------------------------------------------------
+# Chrome DevTools (CDP) tools
+# ---------------------------------------------------------------------------
+
+
+def _chrome_port(port: int | None) -> int:
+    if port:
+        return int(port)
+    return int(globals().get("CHROME_DEBUG_PORT", 9222) or 9222)
+
+
+@mcp.tool(
+    name="chrome_ensure",
+    title="Ensure Debuggable Chrome",
+    annotations=LOCAL_WRITE_TOOL,
+    description=(
+        "Ensure a Chrome with an open DevTools debugging port is running; "
+        "launches a dedicated automation instance (own profile under the state "
+        "dir) when none is reachable. Run this before other chrome_* tools."
+    ),
+)
+@traced("chrome_ensure")
+def chrome_ensure(
+    url: str | None = None,
+    port: int | None = None,
+    headless: bool = False,
+) -> dict[str, object]:
+    return chrome_impl.ensure_running(
+        _chrome_port(port),
+        binary=(globals().get("CHROME_BINARY", "") or "").strip() or None,
+        user_data_dir=globals().get("STATE_DIR", STATE_DIR) / "chrome-profile",
+        url=url,
+        headless=headless,
+    )
+
+
+@mcp.tool(
+    name="chrome_tabs",
+    title="List Chrome Tabs",
+    annotations=READ_ONLY_TOOL,
+    description="List open tabs (id, title, url) of the debuggable Chrome instance.",
+)
+@traced("chrome_tabs", result_fn=_read_result_summary)
+def chrome_tabs(port: int | None = None) -> dict[str, object]:
+    try:
+        tabs = chrome_impl.list_tabs(_chrome_port(port))
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": {
+                "code": "debugger_unreachable",
+                "message": f"DevTools port unreachable: {exc}. Run chrome_ensure first.",
+            },
+        }
+    return {"success": True, "tab_count": len(tabs), "tabs": tabs}
+
+
+@mcp.tool(
+    name="chrome_open",
+    title="Open URL in Chrome",
+    annotations=OPEN_WORLD_WRITE_TOOL,
+    description="Open a URL in a new tab of the debuggable Chrome instance.",
+)
+@traced("chrome_open")
+def chrome_open(url: str, port: int | None = None) -> dict[str, object]:
+    try:
+        tab = chrome_impl.open_tab(_chrome_port(port), url)
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": {
+                "code": "open_failed",
+                "message": f"Could not open tab: {exc}. Run chrome_ensure first.",
+            },
+        }
+    return {
+        "success": True,
+        "tab": {"id": tab.get("id"), "title": tab.get("title"), "url": tab.get("url")},
+    }
+
+
+@mcp.tool(
+    name="chrome_screenshot",
+    title="Screenshot Chrome Tab",
+    annotations=READ_ONLY_TOOL,
+    description=(
+        "Capture a screenshot of a Chrome tab (target = tab id or url/title "
+        "substring; defaults to the first page tab). Set full_page=True for the "
+        "whole scrollable page. Returns viewable image content."
+    ),
+)
+@traced("chrome_screenshot")
+def chrome_screenshot(
+    target: str | None = None,
+    full_page: bool = False,
+    max_width: int = 1400,
+    format: str = "jpeg",
+    quality: int = 80,
+    port: int | None = None,
+) -> Image:
+    result = chrome_impl.screenshot_tab(
+        _chrome_port(port),
+        target,
+        full_page=full_page,
+        max_width=max_width,
+        format=format,
+        quality=quality,
+    )
+    if not result.get("success"):
+        error = result.get("error") or {}
+        raise ToolError(str(error.get("message") or "Screenshot failed"))
+    return Image(data=result["data"], format=result["format"])
+
+
+@mcp.tool(
+    name="chrome_eval",
+    title="Evaluate JavaScript in Chrome",
+    annotations=OPEN_WORLD_WRITE_TOOL,
+    description=(
+        "Evaluate a JavaScript expression in a Chrome tab via CDP "
+        "(Runtime.evaluate; promises awaited, result returned by value). "
+        "target = tab id or url/title substring; defaults to the first page tab."
+    ),
+)
+@traced("chrome_eval")
+def chrome_eval(
+    expression: str,
+    target: str | None = None,
+    await_promise: bool = True,
+    timeout: float = 20.0,
+    port: int | None = None,
+) -> dict[str, object]:
+    return chrome_impl.evaluate_in_tab(
+        _chrome_port(port),
+        expression,
+        target,
+        await_promise=await_promise,
+        timeout=min(float(timeout), 45.0),
+    )
+
+
+@mcp.tool(
+    name="chrome_console",
+    title="Collect Chrome Console",
+    annotations=OPEN_WORLD_WRITE_TOOL,
+    description=(
+        "Collect console messages / JS exceptions / log entries from a Chrome "
+        "tab for `duration` seconds. Optionally navigate to a URL first to "
+        "capture messages from page load."
+    ),
+)
+@traced("chrome_console")
+def chrome_console(
+    target: str | None = None,
+    duration: float = 4.0,
+    navigate: str | None = None,
+    port: int | None = None,
+) -> dict[str, object]:
+    return chrome_impl.collect_console(
+        _chrome_port(port),
+        target,
+        duration=min(float(duration), 30.0),
+        navigate=navigate,
+    )
+
+
+@mcp.tool(
+    name="chrome_network",
+    title="Collect Chrome Network Activity",
+    annotations=OPEN_WORLD_WRITE_TOOL,
+    description=(
+        "Record network requests (url, method, status, mime type, failures) in "
+        "a Chrome tab for `duration` seconds. Optionally navigate to a URL "
+        "first to capture page-load traffic."
+    ),
+)
+@traced("chrome_network")
+def chrome_network(
+    target: str | None = None,
+    duration: float = 6.0,
+    navigate: str | None = None,
+    max_requests: int = 100,
+    port: int | None = None,
+) -> dict[str, object]:
+    return chrome_impl.collect_network(
+        _chrome_port(port),
+        target,
+        duration=min(float(duration), 30.0),
+        navigate=navigate,
+        max_requests=max_requests,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dev service and network tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool(
+    name="start_service",
+    title="Start Dev Service",
+    annotations=LOCAL_WRITE_TOOL,
+    description=(
+        "Start a named long-running background service (dev server, watcher). "
+        "Output goes to a per-service log under the state dir; pass `port` to "
+        "also report whether the port is listening. Manage it with "
+        "stop_service / list_services / service_logs."
+    ),
+)
+@traced("start_service")
+def start_service(
+    name: str,
+    command: str,
+    cwd: str | None = None,
+    port: int | None = None,
+    env: dict[str, str] | None = None,
+) -> dict[str, object]:
+    resolved_cwd = resolve_cwd(cwd, WORKSPACE_ROOT)
+    return service_manager.start(name, command, resolved_cwd, port=port, env=env)
+
+
+@mcp.tool(
+    name="stop_service",
+    title="Stop Dev Service",
+    annotations=LOCAL_WRITE_TOOL,
+    description="Stop a named background service (kills its whole process tree).",
+)
+@traced("stop_service")
+def stop_service(name: str) -> dict[str, object]:
+    return service_manager.stop(name)
+
+
+@mcp.tool(
+    name="list_services",
+    title="List Dev Services",
+    annotations=READ_ONLY_TOOL,
+    description="List known background services with pid, running state, port, and log path.",
+)
+@traced("list_services", result_fn=_read_result_summary)
+def list_services() -> dict[str, object]:
+    services = service_manager.list()
+    return {"success": True, "service_count": len(services), "services": services}
+
+
+@mcp.tool(
+    name="service_logs",
+    title="Read Dev Service Logs",
+    annotations=READ_ONLY_TOOL,
+    description="Read the tail of a background service's captured output log.",
+)
+@traced("service_logs", result_fn=_read_result_summary)
+def service_logs(name: str, tail_lines: int = 100) -> dict[str, object]:
+    return service_manager.logs(name, tail_lines=tail_lines)
+
+
+@mcp.tool(
+    name="port_check",
+    title="Check TCP Port",
+    annotations=READ_ONLY_TOOL,
+    description="Check whether a local TCP port is listening and which pids own it.",
+)
+@traced("port_check", result_fn=_read_result_summary)
+def port_check(port: int) -> dict[str, object]:
+    return port_status_impl(port)
+
+
+@mcp.tool(
+    name="kill_port",
+    title="Kill Processes on Port",
+    annotations=LOCAL_WRITE_TOOL,
+    description="Kill the process tree(s) currently listening on a local TCP port.",
+)
+@traced("kill_port")
+def kill_port(port: int) -> dict[str, object]:
+    return kill_port_impl(port)
+
+
+@mcp.tool(
+    name="http_request",
+    title="HTTP Request",
+    annotations=OPEN_WORLD_WRITE_TOOL,
+    description=(
+        "Send an HTTP request (GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS) and "
+        "return status, headers, and a size-capped body (JSON parsed when "
+        "possible). Ideal for testing local APIs and webhooks."
+    ),
+)
+@traced("http_request")
+def http_request(
+    url: str,
+    method: str = "GET",
+    headers: dict[str, str] | None = None,
+    body: str | None = None,
+    json_body: object | None = None,
+    timeout: float = 30.0,
+    follow_redirects: bool = True,
+) -> dict[str, object]:
+    return http_request_impl(
+        url=url,
+        method=method,
+        headers=headers,
+        body=body,
+        json_body=json_body,
+        timeout=min(float(timeout), 45.0),
+        follow_redirects=follow_redirects,
+    )
 
 
 def _consume_ready_fd() -> int | None:
